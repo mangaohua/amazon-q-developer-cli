@@ -3,6 +3,7 @@ mod debug;
 mod diagnostics;
 mod feed;
 mod issue;
+mod server;
 mod settings;
 mod user;
 
@@ -109,6 +110,8 @@ pub enum CliRootCommands {
     /// Model Context Protocol (MCP)
     #[command(subcommand)]
     Mcp(Mcp),
+    /// Start OpenAI-compatible HTTP server
+    Server(server::ServerArgs),
 }
 
 impl CliRootCommands {
@@ -124,6 +127,7 @@ impl CliRootCommands {
             CliRootCommands::Version { .. } => "version",
             CliRootCommands::Chat { .. } => "chat",
             CliRootCommands::Mcp(_) => "mcp",
+            CliRootCommands::Server(_) => "server",
         }
     }
 }
@@ -213,6 +217,7 @@ impl Cli {
                 CliRootCommands::Version { changelog } => Self::print_version(changelog),
                 CliRootCommands::Chat(args) => chat::launch_chat(&mut database, &telemetry, args).await,
                 CliRootCommands::Mcp(args) => mcp::execute_mcp(args).await,
+                CliRootCommands::Server(args) => args.execute(&mut database, &cli_context).await,
             },
             // Root command
             None => chat::launch_chat(&mut database, &telemetry, chat::cli::Chat::default()).await,
