@@ -51,7 +51,29 @@ struct ChatCompletionRequest {
 #[derive(Debug, Deserialize, Serialize)]
 struct ChatMessage {
     role: String,
-    content: String,
+    content: ChatMessageContent,
+    tool_calls: Option<serde_json::Value>,
+    function_call: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ContentPart {
+    #[serde(rename = "type")]
+    part_type: String,
+    text: Option<String>,
+    image_url: Option<ImageUrl>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ImageUrl {
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +84,40 @@ struct ChatCompletionResponse {
     model: String,
     choices: Vec<Choice>,
     usage: Usage,
+    system_fingerprint: Option<String>,
+    service_tier: Option<String>,
+    prompt_logprobs: Option<serde_json::Value>,
+    kv_transfer_params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionChunk {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<ChunkChoice>,
+    system_fingerprint: Option<String>,
+    service_tier: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkChoice {
+    index: u32,
+    delta: ChunkDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_call: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +132,8 @@ struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    completion_tokens_details: Option<serde_json::Value>,
+    prompt_tokens_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,10 +359,24 @@ async fn handle_chat_completion(
     
     debug!("Chat completion request: {:?}", chat_request);
     
+    // Check if streaming is requested
+    let is_streaming = chat_request.stream.unwrap_or(false);
+    
+    if is_streaming {
+        handle_streaming_completion(chat_request, state).await
+    } else {
+        handle_non_streaming_completion(chat_request, state).await
+    }
+}
+
+async fn handle_non_streaming_completion(
+    chat_request: ChatCompletionRequest,
+    state: Arc<Mutex<ServerState>>,
+) -> Result<Response<String>, hyper::Error> {
     // Convert messages to Amazon Q format
     let user_message = if let Some(last_message) = chat_request.messages.last() {
         if last_message.role == "user" {
-            last_message.content.clone()
+            extract_text_content(&last_message.content)
         } else {
             return Ok(create_error_response(
                 StatusCode::BAD_REQUEST,
@@ -320,6 +392,8 @@ async fn handle_chat_completion(
         ));
     };
     
+    debug!("Extracted user message: {}", user_message);
+    
     // Build conversation history
     let mut history = Vec::new();
     for (i, msg) in chat_request.messages.iter().enumerate() {
@@ -331,7 +405,7 @@ async fn handle_chat_completion(
             "user" => {
                 history.push(crate::api_client::model::ChatMessage::UserInputMessage(
                     UserInputMessage {
-                        content: msg.content.clone(),
+                        content: extract_text_content(&msg.content),
                         user_input_message_context: None,
                         user_intent: None,
                         images: None,
@@ -342,7 +416,7 @@ async fn handle_chat_completion(
                 history.push(crate::api_client::model::ChatMessage::AssistantResponseMessage(
                     crate::api_client::model::AssistantResponseMessage {
                         message_id: None,
-                        content: msg.content.clone(),
+                        content: extract_text_content(&msg.content),
                         tool_uses: None,
                     }
                 ));
@@ -352,6 +426,8 @@ async fn handle_chat_completion(
             }
         }
     }
+    
+    debug!("History length: {}", history.len());
     
     // Create conversation state
     let conversation_state = ConversationState {
@@ -366,7 +442,7 @@ async fn handle_chat_completion(
     };
     
     // Send to Amazon Q
-    let mut state_guard = state.lock().await;
+    let state_guard = state.lock().await;
     let response = match state_guard.client.send_message(conversation_state).await {
         Ok(response) => response,
         Err(e) => {
@@ -382,16 +458,30 @@ async fn handle_chat_completion(
     // Collect the streaming response
     let mut content = String::new();
     let mut response = response;
+    let mut has_content = false;
     
     loop {
         match response.recv().await {
             Ok(Some(event)) => {
+                debug!("Received event: {:?}", event);
                 match event {
                     crate::api_client::model::ChatResponseStream::AssistantResponseEvent { content: text } => {
+                        debug!("Assistant response: {}", text);
                         content.push_str(&text);
+                        has_content = true;
                     },
                     crate::api_client::model::ChatResponseStream::CodeEvent { content: code } => {
+                        debug!("Code event: {}", code);
                         content.push_str(&code);
+                        has_content = true;
+                    },
+                    crate::api_client::model::ChatResponseStream::InvalidStateEvent { reason, message } => {
+                        error!("Invalid state event: {} - {}", reason, message);
+                        return Ok(create_error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!("Invalid state: {} - {}", reason, message),
+                            "invalid_state"
+                        ));
                     },
                     _ => {
                         debug!("Received other event type: {:?}", event);
@@ -400,18 +490,29 @@ async fn handle_chat_completion(
             },
             Ok(None) => {
                 // Stream ended
+                debug!("Stream ended, has_content: {}, content length: {}", has_content, content.len());
                 break;
             },
             Err(e) => {
                 error!("Stream error: {}", e);
-                break;
+                return Ok(create_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Stream error: {}", e),
+                    "stream_error"
+                ));
             }
         }
     }
     
+    // Ensure we have some content to return
+    if content.is_empty() {
+        warn!("No content received from Amazon Q, providing default response");
+        content = "I apologize, but I wasn't able to generate a response. Please try again.".to_string();
+    }
+    
     // Create OpenAI-compatible response
     let completion_response = ChatCompletionResponse {
-        id: format!("chatcmpl-{}", uuid::Uuid::new_v4().to_string()),
+        id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple().to_string()),
         object: "chat.completion".to_string(),
         created: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -422,7 +523,9 @@ async fn handle_chat_completion(
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content,
+                content: ChatMessageContent::Text(content.clone()),
+                tool_calls: None,
+                function_call: None,
             },
             finish_reason: "stop".to_string(),
         }],
@@ -430,15 +533,316 @@ async fn handle_chat_completion(
             prompt_tokens: 0, // Amazon Q doesn't provide token counts
             completion_tokens: 0,
             total_tokens: 0,
+            completion_tokens_details: None,
+            prompt_tokens_details: None,
         },
+        system_fingerprint: None,
+        service_tier: None,
+        prompt_logprobs: None,
+        kv_transfer_params: None,
     };
+    
+    debug!("Sending response with content length: {}", content.len());
+    let response_json = serde_json::to_string(&completion_response).unwrap();
+    debug!("Response JSON: {}", response_json);
     
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
         .header("Access-Control-Allow-Origin", "*")
-        .body(serde_json::to_string(&completion_response).unwrap())
+        .body(response_json)
         .unwrap())
+}
+
+async fn handle_streaming_completion(
+    chat_request: ChatCompletionRequest,
+    state: Arc<Mutex<ServerState>>,
+) -> Result<Response<String>, hyper::Error> {
+    // Convert messages to Amazon Q format (same as non-streaming)
+    let user_message = if let Some(last_message) = chat_request.messages.last() {
+        if last_message.role == "user" {
+            extract_text_content(&last_message.content)
+        } else {
+            return Ok(create_error_response(
+                StatusCode::BAD_REQUEST,
+                "Last message must be from user",
+                "invalid_request"
+            ));
+        }
+    } else {
+        return Ok(create_error_response(
+            StatusCode::BAD_REQUEST,
+            "No messages provided",
+            "invalid_request"
+        ));
+    };
+    
+    debug!("Extracted user message for streaming: {}", user_message);
+    
+    // Build conversation history
+    let mut history = Vec::new();
+    for (i, msg) in chat_request.messages.iter().enumerate() {
+        if i == chat_request.messages.len() - 1 {
+            break; // Skip the last message as it's the current user input
+        }
+        
+        match msg.role.as_str() {
+            "user" => {
+                history.push(crate::api_client::model::ChatMessage::UserInputMessage(
+                    UserInputMessage {
+                        content: extract_text_content(&msg.content),
+                        user_input_message_context: None,
+                        user_intent: None,
+                        images: None,
+                    }
+                ));
+            },
+            "assistant" => {
+                history.push(crate::api_client::model::ChatMessage::AssistantResponseMessage(
+                    crate::api_client::model::AssistantResponseMessage {
+                        message_id: None,
+                        content: extract_text_content(&msg.content),
+                        tool_uses: None,
+                    }
+                ));
+            },
+            _ => {
+                warn!("Unsupported message role: {}", msg.role);
+            }
+        }
+    }
+    
+    debug!("History length for streaming: {}", history.len());
+    
+    // Create conversation state
+    let conversation_state = ConversationState {
+        conversation_id: None,
+        user_input_message: UserInputMessage {
+            content: user_message,
+            user_input_message_context: None,
+            user_intent: None,
+            images: None,
+        },
+        history: if history.is_empty() { None } else { Some(history) },
+    };
+    
+    // Send to Amazon Q
+    let state_guard = state.lock().await;
+    let response = match state_guard.client.send_message(conversation_state).await {
+        Ok(response) => response,
+        Err(e) => {
+            error!("Amazon Q API error: {}", e);
+            return Ok(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Amazon Q API error: {}", e),
+                "api_error"
+            ));
+        }
+    };
+    
+    let model_name = state_guard.model_name.clone();
+    drop(state_guard); // Release the lock
+    
+    // Create streaming response
+    let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple().to_string());
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    
+    // Build the streaming response body
+    let mut streaming_body = String::new();
+    let mut response = response;
+    let mut is_first_chunk = true;
+    
+    loop {
+        match response.recv().await {
+            Ok(Some(event)) => {
+                debug!("Received streaming event: {:?}", event);
+                match event {
+                    crate::api_client::model::ChatResponseStream::AssistantResponseEvent { content: text } => {
+                        debug!("Streaming assistant response: {}", text);
+                        
+                        let chunk = if is_first_chunk {
+                            is_first_chunk = false;
+                            ChatCompletionChunk {
+                                id: chat_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model_name.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChunkDelta {
+                                        role: Some("assistant".to_string()),
+                                        content: Some(text),
+                                        tool_calls: None,
+                                        function_call: None,
+                                    },
+                                    finish_reason: None,
+                                }],
+                                system_fingerprint: None,
+                                service_tier: None,
+                            }
+                        } else {
+                            ChatCompletionChunk {
+                                id: chat_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model_name.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChunkDelta {
+                                        role: None,
+                                        content: Some(text),
+                                        tool_calls: None,
+                                        function_call: None,
+                                    },
+                                    finish_reason: None,
+                                }],
+                                system_fingerprint: None,
+                                service_tier: None,
+                            }
+                        };
+                        
+                        let chunk_json = serde_json::to_string(&chunk).unwrap();
+                        streaming_body.push_str(&format!("data: {}\n\n", chunk_json));
+                    },
+                    crate::api_client::model::ChatResponseStream::CodeEvent { content: code } => {
+                        debug!("Streaming code event: {}", code);
+                        
+                        let chunk = ChatCompletionChunk {
+                            id: chat_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created,
+                            model: model_name.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: if is_first_chunk { Some("assistant".to_string()) } else { None },
+                                    content: Some(code),
+                                    tool_calls: None,
+                                    function_call: None,
+                                },
+                                finish_reason: None,
+                            }],
+                            system_fingerprint: None,
+                            service_tier: None,
+                        };
+                        
+                        if is_first_chunk {
+                            is_first_chunk = false;
+                        }
+                        
+                        let chunk_json = serde_json::to_string(&chunk).unwrap();
+                        streaming_body.push_str(&format!("data: {}\n\n", chunk_json));
+                    },
+                    crate::api_client::model::ChatResponseStream::InvalidStateEvent { reason, message } => {
+                        error!("Invalid state event in streaming: {} - {}", reason, message);
+                        return Ok(create_error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!("Invalid state: {} - {}", reason, message),
+                            "invalid_state"
+                        ));
+                    },
+                    _ => {
+                        debug!("Received other streaming event type: {:?}", event);
+                    }
+                }
+            },
+            Ok(None) => {
+                // Stream ended - send final chunk
+                debug!("Streaming ended");
+                let final_chunk = ChatCompletionChunk {
+                    id: chat_id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model_name.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: None,
+                            content: None,
+                            tool_calls: None,
+                            function_call: None,
+                        },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    system_fingerprint: None,
+                    service_tier: None,
+                };
+                
+                let final_chunk_json = serde_json::to_string(&final_chunk).unwrap();
+                streaming_body.push_str(&format!("data: {}\n\n", final_chunk_json));
+                streaming_body.push_str("data: [DONE]\n\n");
+                break;
+            },
+            Err(e) => {
+                error!("Streaming error: {}", e);
+                return Ok(create_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Stream error: {}", e),
+                    "stream_error"
+                ));
+            }
+        }
+    }
+    
+    // If no content was generated, provide a default response
+    if is_first_chunk {
+        warn!("No content received from Amazon Q in streaming mode, providing default response");
+        let default_chunk = ChatCompletionChunk {
+            id: chat_id.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model: model_name.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: Some("assistant".to_string()),
+                    content: Some("I apologize, but I wasn't able to generate a response. Please try again.".to_string()),
+                    tool_calls: None,
+                    function_call: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            system_fingerprint: None,
+            service_tier: None,
+        };
+        
+        let default_chunk_json = serde_json::to_string(&default_chunk).unwrap();
+        streaming_body.push_str(&format!("data: {}\n\n", default_chunk_json));
+        streaming_body.push_str("data: [DONE]\n\n");
+    }
+    
+    debug!("Sending streaming response with {} bytes", streaming_body.len());
+    
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(streaming_body)
+        .unwrap())
+}
+
+fn extract_text_content(content: &ChatMessageContent) -> String {
+    match content {
+        ChatMessageContent::Text(text) => text.clone(),
+        ChatMessageContent::Parts(parts) => {
+            parts.iter()
+                .filter_map(|part| {
+                    if part.part_type == "text" {
+                        part.text.as_ref()
+                    } else {
+                        None
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
 }
 
 fn create_error_response(status: StatusCode, message: &str, error_type: &str) -> Response<String> {
