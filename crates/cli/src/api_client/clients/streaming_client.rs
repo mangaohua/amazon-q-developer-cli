@@ -45,12 +45,20 @@ mod inner {
     use amzn_qdeveloper_streaming_client::Client as QDeveloperStreamingClient;
 
     use crate::api_client::model::ChatResponseStream;
+    use crate::cli::chat::openai_config::OpenAiConfig;
 
     #[derive(Clone, Debug)]
     pub enum Inner {
         Codewhisperer(CodewhispererStreamingClient),
         QDeveloper(QDeveloperStreamingClient),
+        OpenAI(OpenAiClient),
         Mock(Arc<Mutex<std::vec::IntoIter<Vec<ChatResponseStream>>>>),
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct OpenAiClient {
+        pub config: OpenAiConfig,
+        pub http_client: reqwest::Client,
     }
 }
 
@@ -62,6 +70,14 @@ pub struct StreamingClient {
 
 impl StreamingClient {
     pub async fn new(database: &mut Database) -> Result<Self, ApiClientError> {
+        // Check if OpenAI-compatible provider is configured
+        use crate::cli::chat::openai_config::OpenAiConfig;
+        let openai_config = OpenAiConfig::from_database(database);
+        
+        if openai_config.is_openai_compatible() {
+            return Self::new_openai_client(openai_config).await;
+        }
+        
         Ok(
             if crate::util::system_info::in_cloudshell()
                 || std::env::var("Q_USE_SENDMESSAGE").is_ok_and(|v| !v.is_empty())
@@ -71,6 +87,21 @@ impl StreamingClient {
                 Self::new_codewhisperer_client(database, &Endpoint::load_codewhisperer(database)).await?
             },
         )
+    }
+
+    pub async fn new_openai_client(config: crate::cli::chat::openai_config::OpenAiConfig) -> Result<Self, ApiClientError> {
+        let http_client = crate::request::new_client()
+            .map_err(|e| ApiClientError::Other(format!("Failed to create HTTP client: {}", e)))?;
+        
+        let openai_client = inner::OpenAiClient {
+            config,
+            http_client,
+        };
+        
+        Ok(Self {
+            inner: inner::Inner::OpenAI(openai_client),
+            profile: None,
+        })
     }
 
     pub fn mock(events: Vec<Vec<ChatResponseStream>>) -> Self {
@@ -131,14 +162,15 @@ impl StreamingClient {
         conversation_state: ConversationState,
     ) -> Result<SendMessageOutput, ApiClientError> {
         debug!("Sending conversation: {:#?}", conversation_state);
-        let ConversationState {
-            conversation_id,
-            user_input_message,
-            history,
-        } = conversation_state;
 
         match &self.inner {
             inner::Inner::Codewhisperer(client) => {
+                let ConversationState {
+                    conversation_id,
+                    user_input_message,
+                    history,
+                } = conversation_state;
+                
                 let conversation_state = amzn_codewhisperer_streaming_client::types::ConversationState::builder()
                     .set_conversation_id(conversation_id)
                     .current_message(
@@ -181,6 +213,12 @@ impl StreamingClient {
                 }
             },
             inner::Inner::QDeveloper(client) => {
+                let ConversationState {
+                    conversation_id,
+                    user_input_message,
+                    history,
+                } = conversation_state;
+                
                 let conversation_state_builder = amzn_qdeveloper_streaming_client::types::ConversationState::builder()
                     .set_conversation_id(conversation_id)
                     .current_message(amzn_qdeveloper_streaming_client::types::ChatMessage::UserInputMessage(
@@ -201,12 +239,137 @@ impl StreamingClient {
                         .await?,
                 ))
             },
+            inner::Inner::OpenAI(openai_client) => {
+                self.send_openai_message(openai_client, conversation_state).await
+            },
             inner::Inner::Mock(events) => {
                 let mut new_events = events.lock().unwrap().next().unwrap_or_default().clone();
                 new_events.reverse();
                 Ok(SendMessageOutput::Mock(new_events))
             },
         }
+    }
+
+    async fn send_openai_message(
+        &self,
+        openai_client: &inner::OpenAiClient,
+        conversation_state: ConversationState,
+    ) -> Result<SendMessageOutput, ApiClientError> {
+        use serde_json::json;
+        
+        let ConversationState {
+            user_input_message,
+            history,
+            ..
+        } = conversation_state;
+
+        // Convert conversation to OpenAI format
+        let mut messages = Vec::new();
+        
+        // Add history messages
+        if let Some(history) = history {
+            for msg in history {
+                match msg {
+                    crate::api_client::model::ChatMessage::UserInputMessage(user_msg) => {
+                        messages.push(json!({
+                            "role": "user",
+                            "content": user_msg.content
+                        }));
+                    },
+                    crate::api_client::model::ChatMessage::AssistantResponseMessage(assistant_msg) => {
+                        messages.push(json!({
+                            "role": "assistant", 
+                            "content": assistant_msg.content
+                        }));
+                    },
+                }
+            }
+        }
+        
+        // Add current user message
+        messages.push(json!({
+            "role": "user",
+            "content": user_input_message.content
+        }));
+
+        let request_body = json!({
+            "model": openai_client.config.model,
+            "messages": messages,
+            "stream": true
+        });
+
+        let mut request_builder = openai_client.http_client
+            .post(&format!("{}/chat/completions", openai_client.config.base_url))
+            .header("Content-Type", "application/json")
+            .json(&request_body);
+
+        if let Some(api_key) = &openai_client.config.api_key {
+            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        let response = request_builder.send().await
+            .map_err(|e| ApiClientError::Other(format!("OpenAI API request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(ApiClientError::Other(format!(
+                "OpenAI API returned error {}: {}", status, error_text
+            )));
+        }
+
+        // Convert response to our format
+        let response_stream = self.convert_openai_response_stream(response).await?;
+        Ok(SendMessageOutput::OpenAI {
+            events: response_stream,
+            index: 0,
+        })
+    }
+
+    async fn convert_openai_response_stream(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<Vec<ChatResponseStream>, ApiClientError> {
+        use futures::StreamExt;
+        
+        let mut stream_events = Vec::new();
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ApiClientError::Other(format!("Stream error: {}", e)))?;
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            buffer.push_str(&chunk_str);
+
+            // Process complete lines
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].trim().to_string();
+                buffer = buffer[line_end + 1..].to_string();
+
+                if line.starts_with("data: ") {
+                    let data = &line[6..];
+                    if data == "[DONE]" {
+                        break;
+                    }
+                    
+                    if let Ok(json_data) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(choices) = json_data.get("choices").and_then(|v| v.as_array()) {
+                            if let Some(choice) = choices.first() {
+                                if let Some(delta) = choice.get("delta").and_then(|v| v.as_object()) {
+                                    if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                                        stream_events.push(ChatResponseStream::AssistantResponseEvent {
+                                            content: content.to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(stream_events)
     }
 }
 
@@ -216,6 +379,10 @@ pub enum SendMessageOutput {
         amzn_codewhisperer_streaming_client::operation::generate_assistant_response::GenerateAssistantResponseOutput,
     ),
     QDeveloper(amzn_qdeveloper_streaming_client::operation::send_message::SendMessageOutput),
+    OpenAI {
+        events: Vec<ChatResponseStream>,
+        index: usize,
+    },
     Mock(Vec<ChatResponseStream>),
 }
 
@@ -224,6 +391,7 @@ impl SendMessageOutput {
         match self {
             SendMessageOutput::Codewhisperer(output) => output.request_id(),
             SendMessageOutput::QDeveloper(output) => output.request_id(),
+            SendMessageOutput::OpenAI { .. } => Some("<openai-request-id>"),
             SendMessageOutput::Mock(_) => None,
         }
     }
@@ -236,6 +404,15 @@ impl SendMessageOutput {
                 .await?
                 .map(|s| s.into())),
             SendMessageOutput::QDeveloper(output) => Ok(output.send_message_response.recv().await?.map(|s| s.into())),
+            SendMessageOutput::OpenAI { events, index } => {
+                if *index < events.len() {
+                    let event = events[*index].clone();
+                    *index += 1;
+                    Ok(Some(event))
+                } else {
+                    Ok(None)
+                }
+            },
             SendMessageOutput::Mock(vec) => Ok(vec.pop()),
         }
     }
@@ -246,6 +423,7 @@ impl RequestId for SendMessageOutput {
         match self {
             SendMessageOutput::Codewhisperer(output) => output.request_id(),
             SendMessageOutput::QDeveloper(output) => output.request_id(),
+            SendMessageOutput::OpenAI { .. } => Some("<openai-request-id>"),
             SendMessageOutput::Mock(_) => Some("<mock-request-id>"),
         }
     }

@@ -7,7 +7,7 @@ mod hooks;
 mod input_source;
 pub mod mcp;
 mod message;
-mod openai_config;
+pub mod openai_config;
 mod parse;
 mod parser;
 mod prompt;

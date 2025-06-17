@@ -65,6 +65,9 @@ pub enum ApiClientError {
 
     #[error(transparent)]
     AuthError(#[from] AuthError),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 #[cfg(test)]

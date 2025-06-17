@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use clap::Args;
 use eyre::{Result, WrapErr};
-use futures::StreamExt;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
