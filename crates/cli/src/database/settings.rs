@@ -31,6 +31,11 @@ pub enum Setting {
     McpInitTimeout,
     McpNoInteractiveTimeout,
     McpLoadedBefore,
+    // OpenAI Compatible API settings
+    OpenAiApiBaseUrl,
+    OpenAiApiKey,
+    OpenAiModel,
+    OpenAiProvider,
 }
 
 impl AsRef<str> for Setting {
@@ -50,6 +55,10 @@ impl AsRef<str> for Setting {
             Self::McpInitTimeout => "mcp.initTimeout",
             Self::McpNoInteractiveTimeout => "mcp.noInteractiveTimeout",
             Self::McpLoadedBefore => "mcp.loadedBefore",
+            Self::OpenAiApiBaseUrl => "openai.api.baseUrl",
+            Self::OpenAiApiKey => "openai.api.key",
+            Self::OpenAiModel => "openai.model",
+            Self::OpenAiProvider => "openai.provider",
         }
     }
 }
@@ -79,6 +88,10 @@ impl TryFrom<&str> for Setting {
             "mcp.initTimeout" => Ok(Self::McpInitTimeout),
             "mcp.noInteractiveTimeout" => Ok(Self::McpNoInteractiveTimeout),
             "mcp.loadedBefore" => Ok(Self::McpLoadedBefore),
+            "openai.api.baseUrl" => Ok(Self::OpenAiApiBaseUrl),
+            "openai.api.key" => Ok(Self::OpenAiApiKey),
+            "openai.model" => Ok(Self::OpenAiModel),
+            "openai.provider" => Ok(Self::OpenAiProvider),
             _ => Err(DatabaseError::InvalidSetting(value.to_string())),
         }
     }

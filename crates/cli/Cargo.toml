@@ -120,6 +120,7 @@ time = { version = "0.3.39", features = [
     "serde",
 ] }
 tokio = { version = "1.45.0", features = ["full"] }
+tokio-stream = "0.1.15"
 toml = "0.8.12"
 tracing = { version = "0.1.40", features = ["log"] }
 tracing-appender = "0.2.2"

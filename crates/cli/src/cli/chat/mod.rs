@@ -7,6 +7,7 @@ mod hooks;
 mod input_source;
 pub mod mcp;
 mod message;
+mod openai_config;
 mod parse;
 mod parser;
 mod prompt;
@@ -299,6 +300,20 @@ pub async fn launch_chat(database: &mut Database, telemetry: &TelemetryThread, a
         }
         tools
     });
+
+    // Save OpenAI configuration if provided
+    if let Some(provider) = &args.provider {
+        use openai_config::{ChatProvider, OpenAiConfig};
+        
+        let config = OpenAiConfig {
+            provider: ChatProvider::from(provider.as_str()),
+            base_url: args.api_base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            api_key: args.api_key.clone(),
+            model: args.model.clone().unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
+        };
+        
+        config.save_to_database(database).await?;
+    }
 
     chat(
         database,

@@ -32,6 +32,18 @@ pub struct Chat {
     /// '--trust-tools=fs_read,fs_write', trust no tools: '--trust-tools='
     #[arg(long, value_delimiter = ',', value_name = "TOOL_NAMES")]
     pub trust_tools: Option<Vec<String>>,
+    /// Chat provider to use (amazon-q, openai, or custom provider name)
+    #[arg(long, value_name = "PROVIDER")]
+    pub provider: Option<String>,
+    /// OpenAI-compatible API base URL
+    #[arg(long, value_name = "URL")]
+    pub api_base_url: Option<String>,
+    /// API key for OpenAI-compatible providers
+    #[arg(long, value_name = "KEY")]
+    pub api_key: Option<String>,
+    /// Model name to use with OpenAI-compatible providers
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
