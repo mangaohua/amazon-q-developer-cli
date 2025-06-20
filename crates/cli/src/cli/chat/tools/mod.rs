@@ -5,6 +5,7 @@ pub mod fs_write;
 pub mod gh_issue;
 pub mod thinking;
 pub mod use_aws;
+pub mod web_browse;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -26,6 +27,7 @@ use serde::{
 };
 use thinking::Thinking;
 use use_aws::UseAws;
+use web_browse::WebBrowse;
 
 use super::consts::MAX_TOOL_RESPONSE_SIZE;
 use super::util::images::RichImageBlocks;
@@ -42,6 +44,7 @@ pub enum Tool {
     Custom(CustomTool),
     GhIssue(GhIssue),
     Thinking(Thinking),
+    WebBrowse(WebBrowse),
 }
 
 impl Tool {
@@ -55,6 +58,7 @@ impl Tool {
             Tool::Custom(custom_tool) => &custom_tool.name,
             Tool::GhIssue(_) => "gh_issue",
             Tool::Thinking(_) => "thinking (prerelease)",
+            Tool::WebBrowse(_) => "web_browse",
         }
         .to_owned()
     }
@@ -69,6 +73,7 @@ impl Tool {
             Tool::Custom(_) => true,
             Tool::GhIssue(_) => false,
             Tool::Thinking(_) => false,
+            Tool::WebBrowse(_) => false, // Web browsing is generally safe, but could be made configurable
         }
     }
 
@@ -82,6 +87,7 @@ impl Tool {
             Tool::Custom(custom_tool) => custom_tool.invoke(context, updates).await,
             Tool::GhIssue(gh_issue) => gh_issue.invoke(updates).await,
             Tool::Thinking(think) => think.invoke(updates).await,
+            Tool::WebBrowse(web_browse) => web_browse.invoke(context, updates).await,
         }
     }
 
@@ -95,6 +101,7 @@ impl Tool {
             Tool::Custom(custom_tool) => custom_tool.queue_description(updates),
             Tool::GhIssue(gh_issue) => gh_issue.queue_description(updates),
             Tool::Thinking(thinking) => thinking.queue_description(updates),
+            Tool::WebBrowse(web_browse) => web_browse.queue_description(updates),
         }
     }
 
@@ -108,6 +115,7 @@ impl Tool {
             Tool::Custom(custom_tool) => custom_tool.validate(ctx).await,
             Tool::GhIssue(gh_issue) => gh_issue.validate(ctx).await,
             Tool::Thinking(think) => think.validate(ctx).await,
+            Tool::WebBrowse(web_browse) => web_browse.validate(ctx).await,
         }
     }
 }
@@ -187,6 +195,7 @@ impl ToolPermissions {
             "use_aws" => "trust read-only commands".dark_grey(),
             "report_issue" => "trusted".dark_green().bold(),
             "thinking" => "trusted (prerelease)".dark_green().bold(),
+            "web_browse" => "trusted".dark_green().bold(),
             _ if self.trust_all => "trusted".dark_grey().bold(),
             _ => "not trusted".dark_grey(),
         };

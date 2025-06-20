@@ -271,12 +271,46 @@ impl StreamingClient {
             for msg in history {
                 match msg {
                     crate::api_client::model::ChatMessage::UserInputMessage(user_msg) => {
-                        messages.push(json!({
+                        let mut user_message = json!({
                             "role": "user",
                             "content": user_msg.content
-                        }));
+                        });
+                        
+                        // Add tool results if present
+                        if let Some(context) = &user_msg.user_input_message_context {
+                            if let Some(tool_results) = &context.tool_results {
+                                let mut tool_calls = Vec::new();
+                                for tool_result in tool_results {
+                                    let content = tool_result.content.iter()
+                                        .map(|block| match block {
+                                            crate::api_client::model::ToolResultContentBlock::Text(text) => text.clone(),
+                                            crate::api_client::model::ToolResultContentBlock::Json(json_val) => {
+                                                // Convert AWS Document to string representation
+                                                format!("{:?}", json_val)
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    
+                                    tool_calls.push(json!({
+                                        "tool_call_id": tool_result.tool_use_id,
+                                        "content": content
+                                    }));
+                                }
+                                
+                                if !tool_calls.is_empty() {
+                                    user_message["tool_calls"] = json!(tool_calls);
+                                    user_message["role"] = json!("tool");
+                                }
+                            }
+                        }
+                        
+                        messages.push(user_message);
                     },
                     crate::api_client::model::ChatMessage::AssistantResponseMessage(assistant_msg) => {
+                        // Check if this assistant message contains tool calls
+                        // For now, we'll just add it as a regular assistant message
+                        // TODO: Parse assistant message for tool calls if needed
                         messages.push(json!({
                             "role": "assistant", 
                             "content": assistant_msg.content
@@ -287,16 +321,100 @@ impl StreamingClient {
         }
         
         // Add current user message
-        messages.push(json!({
+        let mut current_message = json!({
             "role": "user",
             "content": user_input_message.content
-        }));
+        });
+        
+        // Add tool results if present in current message
+        if let Some(context) = &user_input_message.user_input_message_context {
+            if let Some(tool_results) = &context.tool_results {
+                let mut tool_calls = Vec::new();
+                for tool_result in tool_results {
+                    let content = tool_result.content.iter()
+                        .map(|block| match block {
+                            crate::api_client::model::ToolResultContentBlock::Text(text) => text.clone(),
+                            crate::api_client::model::ToolResultContentBlock::Json(json_val) => {
+                                // Convert AWS Document to string representation
+                                format!("{:?}", json_val)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    
+                    tool_calls.push(json!({
+                        "tool_call_id": tool_result.tool_use_id,
+                        "content": content
+                    }));
+                }
+                
+                if !tool_calls.is_empty() {
+                    current_message["tool_calls"] = json!(tool_calls);
+                    current_message["role"] = json!("tool");
+                }
+            }
+        }
+        
+        messages.push(current_message);
 
-        let request_body = json!({
+        // Get available tools from conversation state
+        let tools = if let Some(context) = &user_input_message.user_input_message_context {
+            if let Some(tools) = &context.tools {
+                let mut openai_tools = Vec::new();
+                for tool in tools {
+                    if let crate::api_client::model::Tool::ToolSpecification(spec) = tool {
+                        openai_tools.push(json!({
+                            "type": "function",
+                            "function": {
+                                "name": spec.name,
+                                "description": spec.description,
+                                "parameters": spec.input_schema.json.as_ref().map(|doc| {
+                                    // Convert FigDocument to JSON value
+                                    // For now, we'll use a simple object structure
+                                    json!({
+                                        "type": "object",
+                                        "properties": {},
+                                        "required": []
+                                    })
+                                }).unwrap_or_else(|| json!({
+                                    "type": "object",
+                                    "properties": {},
+                                    "required": []
+                                }))
+                            }
+                        }));
+                    }
+                }
+                Some(openai_tools)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut request_body = json!({
             "model": openai_client.config.model,
             "messages": messages,
             "stream": true
         });
+
+        if let Some(tools) = tools {
+            if !tools.is_empty() {
+                // Check if this is a Kimi-based API that requires specific tool choice parameters
+                if openai_client.config.base_url.contains("xiaomi.srv") {
+                    // For Kimi-based APIs, don't send tools to avoid tool_choice requirement
+                    debug!("Skipping tools for Kimi-based API to avoid tool_choice requirement");
+                } else {
+                    request_body["tools"] = json!(tools);
+                    // Don't set tool_choice to maintain compatibility with different providers
+                    // Most providers will automatically use tools when they're available
+                    debug!("Sending {} tools to OpenAI-compatible API without tool_choice parameter", tools.len());
+                }
+            }
+        } else {
+            debug!("No tools available for OpenAI-compatible API request");
+        }
 
         let mut request_builder = openai_client.http_client
             .post(&format!("{}/chat/completions", openai_client.config.base_url))
@@ -335,6 +453,7 @@ impl StreamingClient {
         let mut stream_events = Vec::new();
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
+        let mut current_tool_calls: std::collections::HashMap<usize, serde_json::Value> = std::collections::HashMap::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| ApiClientError::Other(format!("Stream error: {}", e)))?;
@@ -356,10 +475,82 @@ impl StreamingClient {
                         if let Some(choices) = json_data.get("choices").and_then(|v| v.as_array()) {
                             if let Some(choice) = choices.first() {
                                 if let Some(delta) = choice.get("delta").and_then(|v| v.as_object()) {
+                                    // Handle text content
                                     if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                                         stream_events.push(ChatResponseStream::AssistantResponseEvent {
                                             content: content.to_string(),
                                         });
+                                    }
+                                    
+                                    // Handle tool calls
+                                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                        for tool_call in tool_calls {
+                                            if let Some(index) = tool_call.get("index").and_then(|v| v.as_u64()) {
+                                                let index = index as usize;
+                                                
+                                                // Initialize or update the tool call
+                                                let entry = current_tool_calls.entry(index).or_insert_with(|| {
+                                                    serde_json::json!({
+                                                        "id": "",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "",
+                                                            "arguments": ""
+                                                        }
+                                                    })
+                                                });
+                                                
+                                                // Update tool call ID
+                                                if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
+                                                    entry["id"] = serde_json::Value::String(id.to_string());
+                                                }
+                                                
+                                                // Update function details
+                                                if let Some(function) = tool_call.get("function").and_then(|v| v.as_object()) {
+                                                    if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+                                                        entry["function"]["name"] = serde_json::Value::String(name.to_string());
+                                                        
+                                                        // Emit tool use start event
+                                                        stream_events.push(ChatResponseStream::ToolUseEvent {
+                                                            tool_use_id: entry["id"].as_str().unwrap_or("").to_string(),
+                                                            name: name.to_string(),
+                                                            input: None,
+                                                            stop: None,
+                                                        });
+                                                    }
+                                                    
+                                                    if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
+                                                        // Append arguments
+                                                        let current_args = entry["function"]["arguments"].as_str().unwrap_or("");
+                                                        let new_args = format!("{}{}", current_args, arguments);
+                                                        entry["function"]["arguments"] = serde_json::Value::String(new_args.clone());
+                                                        
+                                                        // Emit tool use event with partial input
+                                                        stream_events.push(ChatResponseStream::ToolUseEvent {
+                                                            tool_use_id: entry["id"].as_str().unwrap_or("").to_string(),
+                                                            name: entry["function"]["name"].as_str().unwrap_or("").to_string(),
+                                                            input: Some(arguments.to_string()),
+                                                            stop: None,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Check if this is the end of the stream
+                                if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                                    if finish_reason == "tool_calls" {
+                                        // Emit final tool use events
+                                        for (_, tool_call) in current_tool_calls.iter() {
+                                            stream_events.push(ChatResponseStream::ToolUseEvent {
+                                                tool_use_id: tool_call["id"].as_str().unwrap_or("").to_string(),
+                                                name: tool_call["function"]["name"].as_str().unwrap_or("").to_string(),
+                                                input: None,
+                                                stop: Some(true),
+                                            });
+                                        }
                                     }
                                 }
                             }

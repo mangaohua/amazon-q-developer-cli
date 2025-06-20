@@ -82,6 +82,7 @@ use crate::cli::chat::tools::fs_write::FsWrite;
 use crate::cli::chat::tools::gh_issue::GhIssue;
 use crate::cli::chat::tools::thinking::Thinking;
 use crate::cli::chat::tools::use_aws::UseAws;
+use crate::cli::chat::tools::web_browse::WebBrowse;
 use crate::cli::chat::tools::{
     Tool,
     ToolOrigin,
@@ -918,6 +919,7 @@ impl ToolManager {
             "use_aws" => Tool::UseAws(serde_json::from_value::<UseAws>(value.args).map_err(map_err)?),
             "report_issue" => Tool::GhIssue(serde_json::from_value::<GhIssue>(value.args).map_err(map_err)?),
             "thinking" => Tool::Thinking(serde_json::from_value::<Thinking>(value.args).map_err(map_err)?),
+            "web_browse" => Tool::WebBrowse(serde_json::from_value::<WebBrowse>(value.args).map_err(map_err)?),
             // Note that this name is namespaced with server_name{DELIMITER}tool_name
             name => {
                 // Note: tn_map also has tools that underwent no transformation. In otherwords, if

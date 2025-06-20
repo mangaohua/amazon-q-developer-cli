@@ -189,5 +189,34 @@
       },
       "required": ["thought"]
     }
+  },
+  "web_browse": {
+    "name": "web_browse",
+    "description": "Tool for browsing web pages and extracting their content. Supports both HTML and plain text extraction with configurable content length limits and timeout settings. Only HTTP and HTTPS URLs are supported for security reasons.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "The URL to browse. Must be a valid HTTP or HTTPS URL."
+        },
+        "text_only": {
+          "type": "boolean",
+          "description": "Optional: Extract only text content from HTML pages (default: false). When true, HTML tags, scripts, and styles are removed.",
+          "default": false
+        },
+        "max_length": {
+          "type": "integer",
+          "description": "Optional: Maximum content length to return in characters (default: 50000). Content will be truncated if it exceeds this limit.",
+          "default": 50000
+        },
+        "timeout": {
+          "type": "integer",
+          "description": "Optional: Request timeout in seconds (default: 30). The request will fail if it takes longer than this.",
+          "default": 30
+        }
+      },
+      "required": ["url"]
+    }
   }
 }
