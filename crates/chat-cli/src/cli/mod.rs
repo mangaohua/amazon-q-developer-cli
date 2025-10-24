@@ -7,6 +7,7 @@ pub mod experiment;
 pub mod feed;
 mod issue;
 mod mcp;
+mod serve;
 mod settings;
 mod user;
 
@@ -45,6 +46,7 @@ use tracing::{
 
 use crate::cli::chat::ChatArgs;
 use crate::cli::mcp::McpSubcommand;
+use crate::cli::serve::ServeArgs;
 use crate::cli::user::{
     LoginArgs,
     WhoamiArgs,
@@ -122,6 +124,8 @@ pub enum RootSubcommand {
     /// Model Context Protocol (MCP)
     #[command(subcommand)]
     Mcp(McpSubcommand),
+    /// Serve a Claude-compatible REST API
+    Serve(ServeArgs),
 }
 
 impl RootSubcommand {
@@ -133,7 +137,7 @@ impl RootSubcommand {
     }
 
     pub fn requires_auth(&self) -> bool {
-        matches!(self, Self::Chat(_) | Self::Profile)
+        matches!(self, Self::Chat(_) | Self::Profile | Self::Serve(_))
     }
 
     pub async fn execute(self, os: &mut Os) -> Result<ExitCode> {
@@ -170,6 +174,7 @@ impl RootSubcommand {
             Self::Version { changelog } => Cli::print_version(changelog),
             Self::Chat(args) => args.execute(os).await,
             Self::Mcp(args) => args.execute(os, &mut std::io::stderr()).await,
+            Self::Serve(args) => args.execute(os).await,
         }
     }
 }
@@ -194,6 +199,7 @@ impl Display for RootSubcommand {
             Self::Issue(_) => "issue",
             Self::Version { .. } => "version",
             Self::Mcp(_) => "mcp",
+            Self::Serve(_) => "serve",
         };
 
         write!(f, "{name}")

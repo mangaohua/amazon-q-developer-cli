@@ -1490,6 +1490,7 @@ mod tests {
         let agents = {
             let mut agents = Agents::default();
             let mut agent = Agent::default();
+            agent.name = "TestAgent".to_string();
             agent.resources.push(AMAZONQ_FILENAME.into());
             agent.resources.push(AGENTS_FILENAME.into());
             agents.agents.insert("TestAgent".to_string(), agent);
