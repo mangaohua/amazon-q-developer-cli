@@ -161,6 +161,7 @@ async fn handle_streaming_response(
     initial_request_id: Option<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, ServeError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(16);
+    let message_id = uuid::Uuid::new_v4().to_string();
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
@@ -174,7 +175,9 @@ async fn handle_streaming_response(
         }
     }
 
-    let body = StreamBody::new(ReceiverStream::new(rx).map(|chunk| chunk.map(Frame::data)));
+    let body = StreamBody::new(
+        ReceiverStream::new(rx).map(|chunk| chunk.map(Frame::data)),
+    );
     let response = builder
         .body(BoxBody::new(body))
         .map_err(|err| ServeError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -187,6 +190,9 @@ async fn handle_streaming_response(
         let mut aggregated_tool_uses: Vec<AssistantToolUse> = Vec::new();
         let mut latest_metadata: Option<RequestMetadata> = None;
         let mut final_message: Option<AssistantMessage> = None;
+        let mut text_block_index: Option<usize> = None;
+        let mut next_block_index: usize = 0;
+        let mut emitted_text_len: usize = 0;
 
         if send_sse(
             &tx,
@@ -194,7 +200,7 @@ async fn handle_streaming_response(
             &serde_json::json!({
                 "type": "message_start",
                 "message": {
-                    "id": null,
+                    "id": message_id,
                     "type": "message",
                     "role": "assistant",
                     "model": resolved_model_clone,
@@ -212,6 +218,58 @@ async fn handle_streaming_response(
             match event {
                 Ok(ResponseEvent::AssistantText(text)) => {
                     aggregated_text.push_str(&text);
+                    let new_text = aggregated_text
+                        .get(emitted_text_len..)
+                        .unwrap_or_default()
+                        .to_string();
+                    emitted_text_len = aggregated_text.len();
+                    if new_text.is_empty() {
+                        continue;
+                    }
+
+                    let index = if let Some(idx) = text_block_index {
+                        idx
+                    } else {
+                        let idx = next_block_index;
+                        if send_sse(
+                            &tx,
+                            "content_block_start",
+                            &serde_json::json!({
+                                "type": "content_block_start",
+                                "index": idx,
+                                "content_block": {
+                                    "type": "text"
+                                }
+                            }),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                        text_block_index = Some(idx);
+                        next_block_index += 1;
+                        idx
+                    };
+
+                    if send_sse(
+                        &tx,
+                        "content_block_delta",
+                        &serde_json::json!({
+                            "type": "content_block_delta",
+                                "index": index,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": new_text
+                                }
+                            }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+
                     if send_sse(
                         &tx,
                         "message_delta",
@@ -219,8 +277,9 @@ async fn handle_streaming_response(
                             "type": "message_delta",
                             "delta": {
                                 "content": [{
+                                    "index": index,
                                     "type": "text_delta",
-                                    "text": text
+                                    "text": new_text
                                 }]
                             }
                         }),
@@ -234,6 +293,55 @@ async fn handle_streaming_response(
                 Ok(ResponseEvent::ToolUseStart { .. }) => {},
                 Ok(ResponseEvent::ToolUse(tool_use)) => {
                     aggregated_tool_uses.push(tool_use.clone());
+                    if let Some(idx) = text_block_index.take() {
+                        let _ = send_sse(
+                            &tx,
+                            "content_block_stop",
+                            &serde_json::json!({
+                                "type": "content_block_stop",
+                                "index": idx
+                            }),
+                        )
+                        .await;
+                    }
+
+                    let current_index = next_block_index;
+                    next_block_index += 1;
+
+                    if send_sse(
+                        &tx,
+                        "content_block_start",
+                        &serde_json::json!({
+                            "type": "content_block_start",
+                            "index": current_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tool_use.id,
+                                "name": if tool_use.orig_name.is_empty() { tool_use.name.clone() } else { tool_use.orig_name.clone() },
+                                "input": tool_use.args
+                            }
+                        }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+
+                    if send_sse(
+                        &tx,
+                        "content_block_stop",
+                        &serde_json::json!({
+                            "type": "content_block_stop",
+                            "index": current_index
+                        }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+
                     if send_sse(
                         &tx,
                         "message_delta",
@@ -241,10 +349,15 @@ async fn handle_streaming_response(
                             "type": "message_delta",
                             "delta": {
                                 "content": [{
+                                    "index": current_index,
                                     "type": "tool_use",
                                     "id": tool_use.id,
                                     "name": if tool_use.orig_name.is_empty() { tool_use.name.clone() } else { tool_use.orig_name.clone() },
                                     "input": tool_use.args
+                                }],
+                                "tool_calls": [{
+                                    "id": tool_use.id,
+                                    "type": "tool_use"
                                 }]
                             }
                         }),
@@ -321,6 +434,9 @@ async fn handle_streaming_response(
             stream_request.model.clone()
         };
 
+        let mut metadata = metadata;
+        metadata.message_id = message_id.clone();
+
         let mut enriched_message = final_message.clone();
         if aggregated_text.is_empty() && !final_message.content().is_empty() {
             aggregated_text.push_str(final_message.content());
@@ -352,6 +468,18 @@ async fn handle_streaming_response(
                 return;
             },
         };
+
+        if let Some(idx) = text_block_index.take() {
+            let _ = send_sse(
+                &tx,
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": idx
+                }),
+            )
+            .await;
+        }
 
         if send_sse(
             &tx,
