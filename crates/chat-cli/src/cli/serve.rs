@@ -4,8 +4,13 @@ use std::sync::Arc;
 
 use clap::Args;
 use eyre::Result;
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::{
+    BodyExt,
+    Full,
+    StreamBody,
+    combinators::BoxBody,
+};
+use hyper::body::{Bytes, Frame, Incoming};
 use hyper::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -14,7 +19,14 @@ use hyper_util::server::conn::auto::Builder as HyperServerBuilder;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::Mutex;
+use tokio::sync::{
+    Mutex,
+    mpsc,
+};
+use tokio_stream::{
+    StreamExt,
+    wrappers::ReceiverStream,
+};
 
 use crate::api_client::model::{
     AssistantResponseMessage,
@@ -112,15 +124,12 @@ impl ServeArgs {
 
 type ApiClient = crate::api_client::ApiClient;
 
-type HandlerResult = Result<Response<Full<Bytes>>, Infallible>;
+type HandlerResult = Result<Response<BoxBody<Bytes, Infallible>>, Infallible>;
 
 async fn handle_request(req: Request<Incoming>, client: ApiClient) -> HandlerResult {
     let response = match (req.method(), req.uri().path()) {
         (&Method::POST, "/v1/messages") => match handle_messages(req, client).await {
-            Ok((response, request_id)) => match build_success_response(response, request_id) {
-                Ok(resp) => resp,
-                Err(err) => err.into_response(),
-            },
+            Ok(resp) => resp,
             Err(err) => err.into_response(),
         },
         _ => ServeError::new(StatusCode::NOT_FOUND, "Endpoint not found").into_response(),
@@ -129,10 +138,252 @@ async fn handle_request(req: Request<Incoming>, client: ApiClient) -> HandlerRes
     Ok(response)
 }
 
+async fn handle_streaming_response(
+    request: AnthropicMessageRequest,
+    resolved_model_id: String,
+    metadata_lock: Arc<Mutex<Option<RequestMetadata>>>,
+    mut stream: SendMessageStream,
+    initial_request_id: Option<String>,
+) -> Result<Response<BoxBody<Bytes, Infallible>>, ServeError> {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(16);
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
+        .header(HeaderName::from_static("cache-control"), HeaderValue::from_static("no-cache"))
+        .header(HeaderName::from_static("connection"), HeaderValue::from_static("keep-alive"))
+        .header(ANTHROPIC_VERSION_HEADER, HeaderValue::from_static(ANTHROPIC_VERSION));
+
+    if let Some(id) = initial_request_id.as_ref() {
+        if let Ok(value) = HeaderValue::from_str(id) {
+            builder = builder.header(REQUEST_ID_HEADER, value);
+        }
+    }
+
+    let body = StreamBody::new(ReceiverStream::new(rx).map(|chunk| chunk.map(Frame::data)));
+    let response = builder
+        .body(BoxBody::new(body))
+        .map_err(|err| ServeError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    let stream_request = request.clone();
+    let resolved_model_clone = resolved_model_id.clone();
+
+    tokio::spawn(async move {
+        let mut aggregated_text = String::new();
+        let mut aggregated_tool_uses: Vec<AssistantToolUse> = Vec::new();
+        let mut latest_metadata: Option<RequestMetadata> = None;
+        let mut final_message: Option<AssistantMessage> = None;
+
+        if send_sse(
+            &tx,
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": null,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": resolved_model_clone,
+                    "content": []
+                }
+            }),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+
+        while let Some(event) = stream.recv().await {
+            match event {
+                Ok(ResponseEvent::AssistantText(text)) => {
+                    aggregated_text.push_str(&text);
+                    if send_sse(
+                        &tx,
+                        "message_delta",
+                        &serde_json::json!({
+                            "type": "message_delta",
+                            "delta": {
+                                "content": [{
+                                    "type": "text_delta",
+                                    "text": text
+                                }]
+                            }
+                        }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                },
+                Ok(ResponseEvent::ToolUseStart { .. }) => {},
+                Ok(ResponseEvent::ToolUse(tool_use)) => {
+                    aggregated_tool_uses.push(tool_use.clone());
+                    if send_sse(
+                        &tx,
+                        "message_delta",
+                        &serde_json::json!({
+                            "type": "message_delta",
+                            "delta": {
+                                "content": [{
+                                    "type": "tool_use",
+                                    "id": tool_use.id,
+                                    "name": if tool_use.orig_name.is_empty() { tool_use.name.clone() } else { tool_use.orig_name.clone() },
+                                    "input": tool_use.args
+                                }]
+                            }
+                        }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                },
+                Ok(ResponseEvent::EndStream {
+                    message,
+                    request_metadata,
+                }) => {
+                    final_message = Some(message);
+                    latest_metadata = Some(request_metadata);
+                    break;
+                },
+                Err(err) => {
+                    let _ = send_sse(
+                        &tx,
+                        "error",
+                        &serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "stream_error",
+                                "message": err.to_string()
+                            }
+                        }),
+                    )
+                    .await;
+                    return;
+                },
+            }
+        }
+
+        let Some(final_message) = final_message else {
+            let _ = send_sse(
+                &tx,
+                "error",
+                &serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "stream_error",
+                        "message": "model response stream ended unexpectedly"
+                    }
+                }),
+            )
+            .await;
+            return;
+        };
+
+        let Some(metadata) = latest_metadata else {
+            let _ = send_sse(
+                &tx,
+                "error",
+                &serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "stream_error",
+                        "message": "missing response metadata"
+                    }
+                }),
+            )
+            .await;
+            return;
+        };
+        let response_model = if stream_request.model.eq_ignore_ascii_case("auto") {
+            metadata
+                .model_id
+                .clone()
+                .unwrap_or_else(|| resolved_model_id.clone())
+        } else {
+            stream_request.model.clone()
+        };
+
+        let mut enriched_message = final_message.clone();
+        if aggregated_text.is_empty() && !final_message.content().is_empty() {
+            aggregated_text.push_str(final_message.content());
+        }
+
+        if !aggregated_tool_uses.is_empty() {
+            enriched_message = AssistantMessage::ToolUse {
+                message_id: final_message.message_id().map(str::to_string),
+                content: aggregated_text.clone(),
+                tool_uses: aggregated_tool_uses.clone(),
+            };
+        }
+
+        let anthropic_response = match build_anthropic_response(&response_model, enriched_message, &metadata) {
+            Ok(resp) => resp,
+            Err(err) => {
+                let _ = send_sse(
+                    &tx,
+                    "error",
+                    &serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "stream_error",
+                            "message": err.message
+                        }
+                    }),
+                )
+                .await;
+                return;
+            },
+        };
+
+        if send_sse(
+            &tx,
+            "message_delta",
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": anthropic_response.stop_reason,
+                    "stop_sequence": anthropic_response.stop_sequence
+                }
+            }),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+
+        if send_sse(
+            &tx,
+            "message_stop",
+            &serde_json::json!({ "type": "message_stop" }),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+
+        let _ = send_sse(
+            &tx,
+            "message",
+            &serde_json::to_value(&anthropic_response).unwrap_or_default(),
+        )
+        .await;
+
+        let mut lock = metadata_lock.lock().await;
+        *lock = Some(metadata);
+    });
+
+    Ok(response)
+}
+
 fn build_success_response(
     response: AnthropicMessageResponse,
     request_id: Option<String>,
-) -> Result<Response<Full<Bytes>>, ServeError> {
+) -> Result<Response<BoxBody<Bytes, Infallible>>, ServeError> {
     let body = serde_json::to_vec(&response)?;
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -146,14 +397,14 @@ fn build_success_response(
     }
 
     builder
-        .body(Full::new(Bytes::from(body)))
+        .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
         .map_err(|err| ServeError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
 async fn handle_messages(
     req: Request<Incoming>,
     client: ApiClient,
-) -> Result<(AnthropicMessageResponse, Option<String>), ServeError> {
+) -> Result<Response<BoxBody<Bytes, Infallible>>, ServeError> {
     let body_bytes = req
         .into_body()
         .collect()
@@ -172,6 +423,19 @@ async fn handle_messages(
     let mut stream = SendMessageStream::send_message(&client, conversation, metadata_lock.clone(), None)
         .await
         .map_err(ServeError::from_send_message_error)?;
+
+    let initial_request_id = stream.request_id().map(str::to_string);
+
+    if request.stream {
+        return handle_streaming_response(
+            request,
+            resolved_model_id,
+            metadata_lock,
+            stream,
+            initial_request_id,
+        )
+        .await;
+    }
 
     let mut final_message = None;
     let mut final_metadata = None;
@@ -214,7 +478,8 @@ async fn handle_messages(
     };
 
     let response = build_anthropic_response(&response_model, message, &metadata)?;
-    Ok((response, metadata.request_id.clone()))
+    let response = build_success_response(response, metadata.request_id.clone())?;
+    Ok(response)
 }
 
 fn build_conversation_state(
@@ -351,16 +616,159 @@ struct ParsedAnthropicMessage {
     tool_results: Vec<ToolUseResult>,
 }
 
-impl TryFrom<AnthropicToolResultContent> for ToolUseResultBlock {
-    type Error = ServeError;
+enum ParsedContentBlock {
+    Text(String),
+    ToolUse(AssistantToolUse),
+    ToolResult(ToolUseResult),
+    Skip,
+}
 
-    fn try_from(value: AnthropicToolResultContent) -> Result<Self, Self::Error> {
-        Ok(match value {
-            AnthropicToolResultContent::Text { text } => ToolUseResultBlock::Text(text),
-            AnthropicToolResultContent::Json { json } => ToolUseResultBlock::Json(json),
-        })
+fn parse_content_block(value: serde_json::Value) -> Result<ParsedContentBlock, ServeError> {
+    use serde_json::Value;
+
+    match value {
+        Value::String(text) => Ok(ParsedContentBlock::Text(text)),
+        Value::Null => Ok(ParsedContentBlock::Skip),
+        Value::Array(items) => {
+            let mut fragments = Vec::new();
+            for item in items {
+                match parse_content_block(item)? {
+                    ParsedContentBlock::Text(text) => fragments.push(text),
+                    ParsedContentBlock::Skip => {},
+                    other => return Ok(other),
+                }
+            }
+            Ok(ParsedContentBlock::Text(fragments.join("\n")))
+        },
+        Value::Object(mut map) => {
+            let type_field = map
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(str::to_lowercase);
+
+            match type_field.as_deref() {
+                Some("text") | Some("input_text") => {
+                    let text = map
+                        .remove("text")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    Ok(ParsedContentBlock::Text(text))
+                },
+                Some("tool_use") => {
+                    let id = map
+                        .remove("id")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .ok_or_else(|| {
+                            ServeError::new(StatusCode::BAD_REQUEST, "tool_use block missing 'id'")
+                        })?;
+                    let name = map
+                        .remove("name")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "tool".to_string());
+                    let input = map.remove("input").unwrap_or(serde_json::Value::Null);
+                    Ok(ParsedContentBlock::ToolUse(AssistantToolUse {
+                        id,
+                        name: name.clone(),
+                        orig_name: name,
+                        args: input.clone(),
+                        orig_args: input,
+                    }))
+                },
+                Some("tool_result") => {
+                    let tool_use_id = map
+                        .remove("tool_use_id")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .ok_or_else(|| {
+                            ServeError::new(
+                                StatusCode::BAD_REQUEST,
+                                "tool_result block missing 'tool_use_id'",
+                            )
+                        })?;
+                    let is_error = map
+                        .remove("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let content_values = map
+                        .remove("content")
+                        .and_then(|v| v.as_array().cloned())
+                        .unwrap_or_default();
+
+                    let mut content_blocks = Vec::new();
+                    for value in content_values {
+                        content_blocks.push(parse_tool_result_content(value)?);
+                    }
+
+                    Ok(ParsedContentBlock::ToolResult(ToolUseResult {
+                        tool_use_id,
+                        content: content_blocks,
+                        status: if is_error {
+                            ToolResultStatus::Error
+                        } else {
+                            ToolResultStatus::Success
+                        },
+                    }))
+                },
+                Some("json") => {
+                    let json_value = map.remove("json").unwrap_or(serde_json::Value::Null);
+                    Ok(ParsedContentBlock::Text(json_value.to_string()))
+                },
+                _ => {
+                    if let Some(Value::String(text)) = map.remove("text") {
+                        Ok(ParsedContentBlock::Text(text))
+                    } else if !map.is_empty() {
+                        Ok(ParsedContentBlock::Text(
+                            serde_json::Value::Object(map).to_string(),
+                        ))
+                    } else {
+                        Ok(ParsedContentBlock::Skip)
+                    }
+                },
+            }
+        },
+        other => Ok(ParsedContentBlock::Text(other.to_string())),
     }
 }
+
+fn parse_tool_result_content(value: serde_json::Value) -> Result<ToolUseResultBlock, ServeError> {
+    use serde_json::Value;
+
+    match value {
+        Value::String(text) => Ok(ToolUseResultBlock::Text(text)),
+        Value::Null => Ok(ToolUseResultBlock::Text(String::new())),
+        Value::Object(mut map) => {
+            let type_field = map
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(str::to_lowercase);
+
+            match type_field.as_deref() {
+                Some("text") | Some("input_text") => {
+                    let text = map
+                        .remove("text")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    Ok(ToolUseResultBlock::Text(text))
+                },
+                Some("json") => {
+                    let json_value = map.remove("json").unwrap_or(serde_json::Value::Null);
+                    Ok(ToolUseResultBlock::Json(json_value))
+                },
+                _ => {
+                    if let Some(text) = map.remove("text").and_then(|v| v.as_str().map(str::to_string))
+                    {
+                        Ok(ToolUseResultBlock::Text(text))
+                    } else if !map.is_empty() {
+                        Ok(ToolUseResultBlock::Json(serde_json::Value::Object(map)))
+                    } else {
+                        Ok(ToolUseResultBlock::Text(String::new()))
+                    }
+                },
+            }
+        },
+        other => Ok(ToolUseResultBlock::Json(other)),
+    }
+}
+
 
 fn render_tool_results_text(results: &[ToolUseResult]) -> String {
     let mut parts = Vec::new();
@@ -449,6 +857,8 @@ struct AnthropicMessageRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(default)]
     tools: Vec<AnthropicTool>,
+    #[serde(default)]
+    stream: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -470,7 +880,7 @@ enum AnthropicRole {
 #[serde(untagged)]
 enum AnthropicSystemPrompt {
     Text(String),
-    Blocks(Vec<AnthropicContentBlock>),
+    Blocks(Vec<serde_json::Value>),
 }
 
 impl AnthropicSystemPrompt {
@@ -486,7 +896,7 @@ impl AnthropicSystemPrompt {
 #[serde(untagged)]
 enum AnthropicMessageContent {
     Text(String),
-    Blocks(Vec<AnthropicContentBlock>),
+    Blocks(Vec<serde_json::Value>),
 }
 
 impl Default for AnthropicMessageContent {
@@ -507,41 +917,12 @@ impl AnthropicMessageContent {
                 let mut text_parts = Vec::new();
                 let mut tool_uses = Vec::new();
                 let mut tool_results = Vec::new();
-                for block in blocks {
-                    match block {
-                        AnthropicContentBlock::Text { text } => text_parts.push(text),
-                        AnthropicContentBlock::ToolUse { id, name, input } => {
-                            let args = input.unwrap_or(serde_json::Value::Null);
-                            tool_uses.push(AssistantToolUse {
-                                id,
-                                name: name.clone(),
-                                orig_name: name,
-                                args: args.clone(),
-                                orig_args: args,
-                            });
-                        },
-                        AnthropicContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error,
-                        } => {
-                            let blocks = content
-                                .into_iter()
-                                .map(|block| block.try_into())
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let status = if is_error { ToolResultStatus::Error } else { ToolResultStatus::Success };
-                            tool_results.push(ToolUseResult {
-                                tool_use_id,
-                                content: blocks,
-                                status,
-                            });
-                        },
-                        AnthropicContentBlock::Unsupported => {
-                            return Err(ServeError::new(
-                                StatusCode::BAD_REQUEST,
-                                "unsupported content block type in message",
-                            ));
-                        },
+                for value in blocks {
+                    match parse_content_block(value)? {
+                        ParsedContentBlock::Text(text) => text_parts.push(text),
+                        ParsedContentBlock::ToolUse(tool_use) => tool_uses.push(tool_use),
+                        ParsedContentBlock::ToolResult(result) => tool_results.push(result),
+                        ParsedContentBlock::Skip => {},
                     }
                 }
                 Ok(ParsedAnthropicMessage {
@@ -563,40 +944,6 @@ impl AnthropicMessageContent {
         }
         Ok(parts.text)
     }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AnthropicContentBlock {
-    Text {
-        text: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        #[serde(default)]
-        input: Option<serde_json::Value>,
-    },
-    ToolResult {
-        tool_use_id: String,
-        #[serde(default)]
-        content: Vec<AnthropicToolResultContent>,
-        #[serde(default)]
-        is_error: bool,
-    },
-    #[serde(other)]
-    Unsupported,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AnthropicToolResultContent {
-    Text {
-        text: String,
-    },
-    Json {
-        json: serde_json::Value,
-    },
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -671,7 +1018,7 @@ impl ServeError {
         self
     }
 
-    fn into_response(self) -> Response<Full<Bytes>> {
+    fn into_response(self) -> Response<BoxBody<Bytes, Infallible>> {
         let payload = serde_json::json!({
             "type": "error",
             "error": {
@@ -692,12 +1039,14 @@ impl ServeError {
             }
         }
 
-        builder.body(Full::new(Bytes::from(body))).unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::new()))
-                .unwrap()
-        })
+        builder
+            .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::new()).map_err(|never| match never {}).boxed())
+                    .unwrap()
+            })
     }
 }
 
@@ -821,6 +1170,16 @@ impl AnthropicTool {
     }
 }
 
+async fn send_sse(
+    tx: &mpsc::Sender<Result<Bytes, Infallible>>,
+    event: &str,
+    payload: &serde_json::Value,
+) -> Result<(), ()> {
+    let data = serde_json::to_string(payload).map_err(|_| ())?;
+    let frame = format!("event: {event}\ndata: {data}\n\n");
+    tx.send(Ok(Bytes::from(frame))).await.map_err(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,6 +1199,7 @@ mod tests {
                 content: AnthropicMessageContent::Text("Hello".to_string()),
             }],
             tools: Vec::new(),
+            stream: false,
         };
 
         let conversation =
@@ -916,25 +1276,21 @@ mod tests {
                 AnthropicMessage {
                     role: AnthropicRole::Assistant,
                     content: AnthropicMessageContent::Blocks(vec![
-                        AnthropicContentBlock::Text {
-                            text: "Invoking search".to_string(),
-                        },
-                        AnthropicContentBlock::ToolUse {
-                            id: "tool-1".to_string(),
-                            name: "search".to_string(),
-                            input: Some(json!({ "query": "rust" })),
-                        },
+                        json!({"type": "text", "text": "Invoking search"}),
+                        json!({"type": "tool_use", "id": "tool-1", "name": "search", "input": { "query": "rust" } }),
                     ]),
                 },
                 AnthropicMessage {
                     role: AnthropicRole::User,
-                    content: AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::ToolResult {
-                        tool_use_id: "tool-1".to_string(),
-                        content: vec![AnthropicToolResultContent::Text {
-                            text: "Search result summary".to_string(),
+                    content: AnthropicMessageContent::Blocks(vec![json!({
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [{
+                            "type": "text",
+                            "text": "Search result summary"
                         }],
-                        is_error: false,
-                    }]),
+                        "is_error": false
+                    })]),
                 },
             ],
             tools: vec![AnthropicTool {
@@ -948,6 +1304,7 @@ mod tests {
                     "required": ["query"]
                 })),
             }],
+            stream: false,
         };
 
         let tools = build_tools(&request.tools).unwrap();
@@ -989,5 +1346,25 @@ mod tests {
                 assert_eq!(spec.name, "search");
             },
         }
+    }
+
+    #[test]
+    fn message_content_accepts_text_without_type() {
+        let parts = AnthropicMessageContent::Blocks(vec![json!({ "text": "hello" })])
+            .into_parts()
+            .expect("should parse");
+        assert_eq!(parts.text, "hello");
+        assert!(parts.tool_uses.is_empty());
+        assert!(parts.tool_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_sse_formats_event() {
+        let (tx, mut rx) = mpsc::channel(1);
+        send_sse(&tx, "test", &json!({"ok": true}))
+            .await
+            .expect("sse should send");
+        let frame = rx.recv().await.expect("frame expected").expect("ok frame");
+        assert_eq!(frame, Bytes::from_static(b"event: test\ndata: {\"ok\":true}\n\n"));
     }
 }
