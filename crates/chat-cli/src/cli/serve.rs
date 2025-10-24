@@ -95,11 +95,26 @@ impl ServeArgs {
                                 });
 
                                 let io = TokioIo::new(stream);
-                                if let Err(err) = HyperServerBuilder::new(TokioExecutor::new())
-                                    .serve_connection_with_upgrades(io, service)
-                                    .await
+                                if let Err(err) =
+                                    HyperServerBuilder::new(TokioExecutor::new())
+                                        .serve_connection_with_upgrades(io, service)
+                                        .await
                                 {
-                                    eprintln!("{} {err}", StyledText::error("server error:"));
+                                    match err.downcast::<hyper::Error>() {
+                                        Ok(hyper_err)
+                                            if hyper_err.is_incomplete_message()
+                                                || hyper_err.is_closed()
+                                                || hyper_err.is_canceled() => {},
+                                        Ok(hyper_err) => {
+                                            eprintln!(
+                                                "{} {hyper_err}",
+                                                StyledText::error("server error:")
+                                            );
+                                        },
+                                        Err(other) => {
+                                            eprintln!("{} {other}", StyledText::error("server error:"));
+                                        },
+                                    }
                                 }
                             });
                         },
