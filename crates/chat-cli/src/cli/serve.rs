@@ -16,10 +16,29 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::Mutex;
 
-use crate::api_client::model::{AssistantResponseMessage, ChatMessage, ConversationState, UserInputMessage};
+use crate::api_client::model::{
+    AssistantResponseMessage,
+    ChatMessage,
+    ConversationState,
+    FigDocument,
+    Tool,
+    ToolInputSchema,
+    ToolResult,
+    ToolResultStatus,
+    ToolSpecification,
+    UserInputMessage,
+};
 use crate::api_client::ModelListResult;
 use crate::cli::chat::{
-    AssistantMessage, RecvError, RequestMetadata, ResponseEvent, SendMessageError, SendMessageStream,
+    AssistantMessage,
+    AssistantToolUse,
+    RecvError,
+    RequestMetadata,
+    ResponseEvent,
+    SendMessageError,
+    SendMessageStream,
+    ToolUseResult,
+    ToolUseResultBlock,
 };
 use crate::os::Os;
 use crate::theme::StyledText;
@@ -146,7 +165,8 @@ async fn handle_messages(
         .map_err(|err| ServeError::new(StatusCode::BAD_REQUEST, format!("invalid request body: {err}")))?;
 
     let resolved_model_id = resolve_model_id(&client, &request.model).await?;
-    let conversation = build_conversation_state(&request, &resolved_model_id)?;
+    let tools = build_tools(&request.tools)?;
+    let conversation = build_conversation_state(&request, &resolved_model_id, &tools)?;
 
     let metadata_lock = Arc::new(Mutex::new(None));
     let mut stream = SendMessageStream::send_message(&client, conversation, metadata_lock.clone(), None)
@@ -200,6 +220,7 @@ async fn handle_messages(
 fn build_conversation_state(
     request: &AnthropicMessageRequest,
     resolved_model_id: &str,
+    available_tools: &[Tool],
 ) -> Result<ConversationState, ServeError> {
     if request.messages.is_empty() {
         return Err(ServeError::new(StatusCode::BAD_REQUEST, "messages cannot be empty"));
@@ -219,7 +240,14 @@ fn build_conversation_state(
         let is_last = index == request.messages.len() - 1;
         match message.role {
             AnthropicRole::System => {
-                let text = message.content.clone().into_text()?;
+                let parts = message.content.clone().into_parts()?;
+                if !parts.tool_uses.is_empty() || !parts.tool_results.is_empty() {
+                    return Err(ServeError::new(
+                        StatusCode::BAD_REQUEST,
+                        "system messages cannot include tool content",
+                    ));
+                }
+                let text = parts.text;
                 if !text.trim().is_empty() {
                     if !system_prompt.is_empty() {
                         system_prompt.push_str("\n\n");
@@ -228,8 +256,26 @@ fn build_conversation_state(
                 }
             },
             AnthropicRole::User => {
+                let mut parts = message.content.clone().into_parts()?;
+                if !parts.tool_uses.is_empty() {
+                    return Err(ServeError::new(
+                        StatusCode::BAD_REQUEST,
+                        "user messages cannot include tool use blocks",
+                    ));
+                }
+
+                if parts.text.trim().is_empty() && !parts.tool_results.is_empty() {
+                    parts.text = render_tool_results_text(&parts.tool_results);
+                }
+
+                let tool_result_models: Option<Vec<ToolResult>> = if parts.tool_results.is_empty() {
+                    None
+                } else {
+                    Some(parts.tool_results.iter().cloned().map(Into::into).collect())
+                };
+
                 let mut user_message = UserInputMessage {
-                    content: message.content.clone().into_text()?,
+                    content: parts.text,
                     images: None,
                     user_input_message_context: None,
                     user_intent: None,
@@ -248,6 +294,18 @@ fn build_conversation_state(
                     }
                 }
 
+                if let Some(tool_results) = tool_result_models {
+                    let mut ctx = user_message.user_input_message_context.unwrap_or_default();
+                    ctx.tool_results = Some(tool_results);
+                    user_message.user_input_message_context = Some(ctx);
+                }
+
+                if is_last && !available_tools.is_empty() {
+                    let mut ctx = user_message.user_input_message_context.unwrap_or_default();
+                    ctx.tools = Some(available_tools.to_vec());
+                    user_message.user_input_message_context = Some(ctx);
+                }
+
                 if is_last {
                     return Ok(ConversationState {
                         conversation_id: None,
@@ -259,11 +317,22 @@ fn build_conversation_state(
                 history.push(ChatMessage::UserInputMessage(user_message));
             },
             AnthropicRole::Assistant => {
-                let content = message.content.clone().into_text()?;
+                let parts = message.content.clone().into_parts()?;
+                if !parts.tool_results.is_empty() {
+                    return Err(ServeError::new(
+                        StatusCode::BAD_REQUEST,
+                        "assistant messages cannot include tool result blocks",
+                    ));
+                }
+                let tool_uses = if parts.tool_uses.is_empty() {
+                    None
+                } else {
+                    Some(parts.tool_uses.iter().cloned().map(Into::into).collect())
+                };
                 history.push(ChatMessage::AssistantResponseMessage(AssistantResponseMessage {
                     message_id: None,
-                    content,
-                    tool_uses: None,
+                    content: parts.text,
+                    tool_uses,
                 }));
             },
         }
@@ -273,6 +342,52 @@ fn build_conversation_state(
         StatusCode::BAD_REQUEST,
         "the final message must be from the user",
     ))
+}
+
+#[derive(Debug)]
+struct ParsedAnthropicMessage {
+    text: String,
+    tool_uses: Vec<AssistantToolUse>,
+    tool_results: Vec<ToolUseResult>,
+}
+
+impl TryFrom<AnthropicToolResultContent> for ToolUseResultBlock {
+    type Error = ServeError;
+
+    fn try_from(value: AnthropicToolResultContent) -> Result<Self, Self::Error> {
+        Ok(match value {
+            AnthropicToolResultContent::Text { text } => ToolUseResultBlock::Text(text),
+            AnthropicToolResultContent::Json { json } => ToolUseResultBlock::Json(json),
+        })
+    }
+}
+
+fn render_tool_results_text(results: &[ToolUseResult]) -> String {
+    let mut parts = Vec::new();
+    for result in results {
+        for block in &result.content {
+            match block {
+                ToolUseResultBlock::Text(text) => {
+                    if !text.trim().is_empty() {
+                        parts.push(text.trim().to_string());
+                    }
+                },
+                ToolUseResultBlock::Json(json) => {
+                    if let Ok(serialized) = serde_json::to_string(json) {
+                        if !serialized.trim().is_empty() {
+                            parts.push(serialized);
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        "<tool results provided>".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 fn build_anthropic_response(
@@ -332,6 +447,8 @@ struct AnthropicMessageRequest {
     #[serde(default)]
     system: Option<AnthropicSystemPrompt>,
     messages: Vec<AnthropicMessage>,
+    #[serde(default)]
+    tools: Vec<AnthropicTool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -360,7 +477,7 @@ impl AnthropicSystemPrompt {
     fn into_text(self) -> Result<String, ServeError> {
         match self {
             Self::Text(text) => Ok(text),
-            Self::Blocks(blocks) => AnthropicMessageContent::Blocks(blocks).into_text(),
+            Self::Blocks(blocks) => AnthropicMessageContent::Blocks(blocks).into_text_only(),
         }
     }
 }
@@ -379,25 +496,72 @@ impl Default for AnthropicMessageContent {
 }
 
 impl AnthropicMessageContent {
-    fn into_text(self) -> Result<String, ServeError> {
+    fn into_parts(self) -> Result<ParsedAnthropicMessage, ServeError> {
         match self {
-            Self::Text(text) => Ok(text),
+            Self::Text(text) => Ok(ParsedAnthropicMessage {
+                text,
+                tool_uses: Vec::new(),
+                tool_results: Vec::new(),
+            }),
             Self::Blocks(blocks) => {
-                let mut parts = Vec::new();
+                let mut text_parts = Vec::new();
+                let mut tool_uses = Vec::new();
+                let mut tool_results = Vec::new();
                 for block in blocks {
                     match block {
-                        AnthropicContentBlock::Text { text } => parts.push(text),
-                        _ => {
+                        AnthropicContentBlock::Text { text } => text_parts.push(text),
+                        AnthropicContentBlock::ToolUse { id, name, input } => {
+                            let args = input.unwrap_or(serde_json::Value::Null);
+                            tool_uses.push(AssistantToolUse {
+                                id,
+                                name: name.clone(),
+                                orig_name: name,
+                                args: args.clone(),
+                                orig_args: args,
+                            });
+                        },
+                        AnthropicContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
+                            let blocks = content
+                                .into_iter()
+                                .map(|block| block.try_into())
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let status = if is_error { ToolResultStatus::Error } else { ToolResultStatus::Success };
+                            tool_results.push(ToolUseResult {
+                                tool_use_id,
+                                content: blocks,
+                                status,
+                            });
+                        },
+                        AnthropicContentBlock::Unsupported => {
                             return Err(ServeError::new(
                                 StatusCode::BAD_REQUEST,
-                                "only text content blocks are supported",
+                                "unsupported content block type in message",
                             ));
                         },
                     }
                 }
-                Ok(parts.join("\n"))
+                Ok(ParsedAnthropicMessage {
+                    text: text_parts.join("\n"),
+                    tool_uses,
+                    tool_results,
+                })
             },
         }
+    }
+
+    fn into_text_only(self) -> Result<String, ServeError> {
+        let parts = self.into_parts()?;
+        if !parts.tool_uses.is_empty() || !parts.tool_results.is_empty() {
+            return Err(ServeError::new(
+                StatusCode::BAD_REQUEST,
+                "tool content blocks are not supported in this context",
+            ));
+        }
+        Ok(parts.text)
     }
 }
 
@@ -407,8 +571,41 @@ enum AnthropicContentBlock {
     Text {
         text: String,
     },
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Option<serde_json::Value>,
+    },
+    ToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: Vec<AnthropicToolResultContent>,
+        #[serde(default)]
+        is_error: bool,
+    },
     #[serde(other)]
     Unsupported,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicToolResultContent {
+    Text {
+        text: String,
+    },
+    Json {
+        json: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AnthropicTool {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    input_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -595,11 +792,43 @@ fn resolve_model_id_from_list(trimmed: &str, model_list: &ModelListResult) -> Re
     ))
 }
 
+fn build_tools(tools: &[AnthropicTool]) -> Result<Vec<Tool>, ServeError> {
+    tools
+        .iter()
+        .cloned()
+        .map(AnthropicTool::into_tool)
+        .collect()
+}
+
+impl AnthropicTool {
+    fn into_tool(self) -> Result<Tool, ServeError> {
+        let description = self.description.unwrap_or_default();
+        let schema_value = self
+            .input_schema
+            .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+        let fig_schema: FigDocument = serde_json::from_value(schema_value).map_err(|err| {
+            ServeError::new(
+                StatusCode::BAD_REQUEST,
+                format!("invalid tool input_schema for '{}': {err}", self.name),
+            )
+        })?;
+
+        Ok(Tool::ToolSpecification(ToolSpecification {
+            name: self.name,
+            description,
+            input_schema: ToolInputSchema { json: Some(fig_schema) },
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::api_client::model::Tool;
     use amzn_codewhisperer_client::types::Model;
+    use crate::api_client::model::ToolResultContentBlock;
+    use serde_json::json;
 
     #[test]
     fn build_conversation_state_uses_resolved_model() {
@@ -610,10 +839,11 @@ mod tests {
                 role: AnthropicRole::User,
                 content: AnthropicMessageContent::Text("Hello".to_string()),
             }],
+            tools: Vec::new(),
         };
 
         let conversation =
-            build_conversation_state(&request, "anthropic.claude-3-haiku-20240307-v1:0").unwrap();
+            build_conversation_state(&request, "anthropic.claude-3-haiku-20240307-v1:0", &[]).unwrap();
 
         assert_eq!(
             conversation.user_input_message.model_id.as_deref(),
@@ -671,5 +901,93 @@ mod tests {
         let err = resolve_model_id_from_list("unknown-model", &model_list).unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.message.contains("unknown-model"));
+    }
+
+    #[test]
+    fn build_conversation_state_handles_tool_flow() {
+        let request = AnthropicMessageRequest {
+            model: "auto".to_string(),
+            system: None,
+            messages: vec![
+                AnthropicMessage {
+                    role: AnthropicRole::User,
+                    content: AnthropicMessageContent::Text("Run a search".to_string()),
+                },
+                AnthropicMessage {
+                    role: AnthropicRole::Assistant,
+                    content: AnthropicMessageContent::Blocks(vec![
+                        AnthropicContentBlock::Text {
+                            text: "Invoking search".to_string(),
+                        },
+                        AnthropicContentBlock::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "search".to_string(),
+                            input: Some(json!({ "query": "rust" })),
+                        },
+                    ]),
+                },
+                AnthropicMessage {
+                    role: AnthropicRole::User,
+                    content: AnthropicMessageContent::Blocks(vec![AnthropicContentBlock::ToolResult {
+                        tool_use_id: "tool-1".to_string(),
+                        content: vec![AnthropicToolResultContent::Text {
+                            text: "Search result summary".to_string(),
+                        }],
+                        is_error: false,
+                    }]),
+                },
+            ],
+            tools: vec![AnthropicTool {
+                name: "search".to_string(),
+                description: Some("Search tool".to_string()),
+                input_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                })),
+            }],
+        };
+
+        let tools = build_tools(&request.tools).unwrap();
+        let conversation = build_conversation_state(&request, "CLAUDE_SONNET", &tools).unwrap();
+
+        let history = conversation.history.expect("history should exist");
+        assert_eq!(history.len(), 2);
+
+        match &history[1] {
+            ChatMessage::AssistantResponseMessage(assistant) => {
+                let tool_uses = assistant.tool_uses.as_ref().expect("tool uses should be present");
+                assert_eq!(tool_uses.len(), 1);
+                assert_eq!(tool_uses[0].tool_use_id, "tool-1");
+                assert_eq!(tool_uses[0].name, "search");
+            },
+            _ => panic!("expected assistant response in history"),
+        }
+
+        let final_message = &conversation.user_input_message;
+        assert_eq!(final_message.model_id.as_deref(), Some("CLAUDE_SONNET"));
+        assert_eq!(final_message.content.trim(), "Search result summary");
+
+        let context = final_message
+            .user_input_message_context
+            .as_ref()
+            .expect("tool results context should be present");
+        let tool_results = context.tool_results.as_ref().expect("tool results should exist");
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_results[0].tool_use_id, "tool-1");
+        assert!(
+            matches!(tool_results[0].content.first(), Some(ToolResultContentBlock::Text(text)) if text == "Search result summary")
+        );
+        assert!(matches!(tool_results[0].status, ToolResultStatus::Success));
+
+        let tools_ctx = context.tools.as_ref().expect("tools should be present");
+        assert_eq!(tools_ctx.len(), 1);
+        match &tools_ctx[0] {
+            Tool::ToolSpecification(spec) => {
+                assert_eq!(spec.name, "search");
+            },
+        }
     }
 }

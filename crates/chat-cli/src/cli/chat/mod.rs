@@ -91,8 +91,8 @@ use eyre::{
     eyre,
 };
 use input_source::InputSource;
-pub use message::AssistantMessage;
-use message::{
+pub use message::{
+    AssistantMessage,
     AssistantToolUse,
     ToolUseResult,
     ToolUseResultBlock,
