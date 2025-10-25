@@ -24,7 +24,7 @@ pub enum ClipboardError {
     #[error("Image processing error: {0}")]
     ImageError(#[from] image::ImageError),
 
-    #[cfg(not(feature = "clipboard"))]
+    #[cfg(any(not(feature = "clipboard"), target_os = "android"))]
     #[error("Clipboard support not available on this platform")]
     NotSupported,
 }
@@ -32,7 +32,7 @@ pub enum ClipboardError {
 /// Paste an image from the clipboard to a temporary file
 ///
 /// Returns the path to the temporary file containing the image
-#[cfg(feature = "clipboard")]
+#[cfg(all(feature = "clipboard", not(target_os = "android")))]
 pub fn paste_image_from_clipboard() -> Result<PathBuf, ClipboardError> {
     // Access system clipboard
     let mut clipboard = arboard::Clipboard::new().map_err(|e| ClipboardError::AccessDenied(e.to_string()))?;
@@ -62,7 +62,7 @@ pub fn paste_image_from_clipboard() -> Result<PathBuf, ClipboardError> {
     Ok(path)
 }
 
-#[cfg(not(feature = "clipboard"))]
+#[cfg(any(not(feature = "clipboard"), target_os = "android"))]
 pub fn paste_image_from_clipboard() -> Result<PathBuf, ClipboardError> {
     Err(ClipboardError::NotSupported)
 }
