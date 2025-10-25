@@ -303,6 +303,8 @@ struct ResponseParser {
     /// Whether or not we are currently receiving tool use delta events. Tuple of
     /// `Some((tool_use_id, name))` if true, [None] otherwise.
     parsing_tool_use: Option<(String, String)>,
+    /// Initial chunk of tool input captured from the first tool use event.
+    pending_tool_input: Option<String>,
 
     request_metadata: Arc<Mutex<Option<RequestMetadata>>>,
     cancel_token: CancellationToken,
@@ -350,6 +352,7 @@ impl ResponseParser {
             assistant_text: String::new(),
             tool_uses: Vec::new(),
             parsing_tool_use: None,
+            pending_tool_input: None,
             request_start_time,
             request_start_time_sys,
             received_response_size: 0,
@@ -370,13 +373,19 @@ impl ResponseParser {
             let cancel_token = self.cancel_token.clone();
             tokio::select! {
                 res = self.recv() => {
-                    let _ = self.event_tx.send(res).await.map_err(|err| error!(?err, "failed to send event to channel"));
+                    if let Err(err) = self.event_tx.send(res).await {
+                        error!(?err, "failed to send event to channel");
+                        self.ended = true;
+                        break;
+                    }
                 },
                 _ = cancel_token.cancelled() => {
                     debug!("response parser was cancelled");
                     let err = self.error(RecvErrorKind::Cancelled);
                     *self.request_metadata.lock().await = Some(err.request_metadata.clone());
-                    let _ = self.event_tx.send(Err(err)).await.map_err(|err| error!(?err, "failed to send error to channel"));
+                    if let Err(send_err) = self.event_tx.send(Err(err)).await {
+                        error!(?send_err, "failed to send error to channel");
+                    }
                     return;
                 },
             }
@@ -423,11 +432,16 @@ impl ResponseParser {
                         input,
                         stop,
                     } => {
-                        debug_assert!(input.is_none(), "Unexpected initial content in first tool use event");
-                        debug_assert!(
-                            stop.is_none_or(|v| !v),
-                            "Unexpected immediate stop in first tool use event"
-                        );
+                        if let Some(stop) = stop {
+                            if stop {
+                                trace!("received tool use stop on initial event");
+                            }
+                        }
+                        if let Some(initial_input) = input {
+                            self.pending_tool_input = Some(initial_input);
+                        } else {
+                            self.pending_tool_input = None;
+                        }
                         self.parsing_tool_use = Some((tool_use_id.clone(), name.clone()));
                         return Ok(ResponseEvent::ToolUseStart { name });
                     },
@@ -468,7 +482,7 @@ impl ResponseParser {
     ///
     /// The arguments are the fields from the first [ChatResponseStream::ToolUseEvent] consumed.
     async fn parse_tool_use(&mut self, id: String, name: String) -> Result<AssistantToolUse, RecvError> {
-        let mut tool_string = String::new();
+        let mut tool_string = self.pending_tool_input.take().unwrap_or_default();
         let start = Instant::now();
         while let Some(ChatResponseStream::ToolUseEvent { .. }) = self.peek().await? {
             if let Some(ChatResponseStream::ToolUseEvent { input, stop, .. }) = self.next().await? {
@@ -566,13 +580,15 @@ impl ResponseParser {
         };
         let orig_name = name.clone();
         let orig_args = args.clone();
-        Ok(AssistantToolUse {
+        let tool_use = AssistantToolUse {
             id,
             name,
             orig_name,
             args,
             orig_args,
-        })
+        };
+        debug!(tool_use_id = tool_use.id, tool_name = tool_use.name, tool_args = ?tool_use.args, "parsed tool use");
+        Ok(tool_use)
     }
 
     /// Returns the next event in the [SendMessageOutput] without consuming it.

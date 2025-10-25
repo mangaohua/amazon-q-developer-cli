@@ -27,6 +27,10 @@ use tokio_stream::{
     StreamExt,
     wrappers::ReceiverStream,
 };
+use tracing::{
+    debug,
+    trace,
+};
 
 use crate::api_client::model::{
     AssistantResponseMessage,
@@ -161,7 +165,6 @@ async fn handle_streaming_response(
     initial_request_id: Option<String>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, ServeError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(16);
-    let message_id = uuid::Uuid::new_v4().to_string();
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
@@ -174,6 +177,9 @@ async fn handle_streaming_response(
             builder = builder.header(REQUEST_ID_HEADER, value);
         }
     }
+    let message_id = initial_request_id
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let body = StreamBody::new(
         ReceiverStream::new(rx).map(|chunk| chunk.map(Frame::data)),
@@ -194,13 +200,18 @@ async fn handle_streaming_response(
         let mut next_block_index: usize = 0;
         let mut emitted_text_len: usize = 0;
 
+        debug!(
+            %message_id,
+            "starting streaming response for Claude-compatible endpoint"
+        );
+
         if send_sse(
             &tx,
             "message_start",
             &serde_json::json!({
                 "type": "message_start",
                 "message": {
-                    "id": message_id,
+                    "id": message_id.clone(),
                     "type": "message",
                     "role": "assistant",
                     "model": resolved_model_clone,
@@ -226,6 +237,13 @@ async fn handle_streaming_response(
                     if new_text.is_empty() {
                         continue;
                     }
+
+                    trace!(
+                        %message_id,
+                        delta_len = new_text.len(),
+                        total_len = aggregated_text.len(),
+                        "streaming text delta"
+                    );
 
                     let index = if let Some(idx) = text_block_index {
                         idx
@@ -270,29 +288,16 @@ async fn handle_streaming_response(
                         return;
                     }
 
-                    if send_sse(
-                        &tx,
-                        "message_delta",
-                        &serde_json::json!({
-                            "type": "message_delta",
-                            "delta": {
-                                "content": [{
-                                    "index": index,
-                                    "type": "text_delta",
-                                    "text": new_text
-                                }]
-                            }
-                        }),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
                 },
                 Ok(ResponseEvent::ToolUseStart { .. }) => {},
                 Ok(ResponseEvent::ToolUse(tool_use)) => {
                     aggregated_tool_uses.push(tool_use.clone());
+                    debug!(
+                        %message_id,
+                        tool_id = tool_use.id,
+                        tool_name = tool_use.name,
+                        "streaming tool_use block"
+                    );
                     if let Some(idx) = text_block_index.take() {
                         let _ = send_sse(
                             &tx,
@@ -342,30 +347,48 @@ async fn handle_streaming_response(
                         return;
                     }
 
-                    if send_sse(
-                        &tx,
-                        "message_delta",
-                        &serde_json::json!({
-                            "type": "message_delta",
-                            "delta": {
-                                "content": [{
-                                    "index": current_index,
-                                    "type": "tool_use",
-                                    "id": tool_use.id,
-                                    "name": if tool_use.orig_name.is_empty() { tool_use.name.clone() } else { tool_use.orig_name.clone() },
-                                    "input": tool_use.args
-                                }],
-                                "tool_calls": [{
-                                    "id": tool_use.id,
-                                    "type": "tool_use"
-                                }]
+                    if let Some(summary) = format_tool_use_summary(&tool_use) {
+                        let idx = if let Some(idx) = text_block_index {
+                            idx
+                        } else {
+                            let idx = next_block_index;
+                            if send_sse(
+                                &tx,
+                                "content_block_start",
+                                &serde_json::json!({
+                                    "type": "content_block_start",
+                                    "index": idx,
+                                    "content_block": { "type": "text" }
+                                }),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
                             }
-                        }),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
+                            text_block_index = Some(idx);
+                            next_block_index += 1;
+                            idx
+                        };
+
+                        aggregated_text.push_str(&summary);
+                        if send_sse(
+                            &tx,
+                            "content_block_delta",
+                            &serde_json::json!({
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": summary
+                                }
+                            }),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
                     }
                 },
                 Ok(ResponseEvent::EndStream {
@@ -373,10 +396,16 @@ async fn handle_streaming_response(
                     request_metadata,
                 }) => {
                     final_message = Some(message);
+                    trace!(%message_id, "received EndStream event from backend");
                     latest_metadata = Some(request_metadata);
                     break;
                 },
                 Err(err) => {
+                    debug!(
+                        %message_id,
+                        error = %err,
+                        "streaming backend returned error event"
+                    );
                     let _ = send_sse(
                         &tx,
                         "error",
@@ -389,12 +418,14 @@ async fn handle_streaming_response(
                         }),
                     )
                     .await;
-                    return;
+                    // signal completion to consumer so parser does not retry endlessly
+                    break;
                 },
             }
         }
 
         let Some(final_message) = final_message else {
+            debug!(%message_id, "stream ended without final message");
             let _ = send_sse(
                 &tx,
                 "error",
@@ -411,6 +442,7 @@ async fn handle_streaming_response(
         };
 
         let Some(metadata) = latest_metadata else {
+            debug!(%message_id, "stream ended without metadata");
             let _ = send_sse(
                 &tx,
                 "error",
@@ -449,6 +481,12 @@ async fn handle_streaming_response(
                 tool_uses: aggregated_tool_uses.clone(),
             };
         }
+
+        debug!(
+            %message_id,
+            "final aggregated_text before response: {}",
+            enriched_message.content()
+        );
 
         let anthropic_response = match build_anthropic_response(&response_model, enriched_message, &metadata) {
             Ok(resp) => resp,
@@ -509,18 +547,116 @@ async fn handle_streaming_response(
             return;
         }
 
-        let _ = send_sse(
-            &tx,
-            "message",
-            &serde_json::to_value(&anthropic_response).unwrap_or_default(),
-        )
-        .await;
-
-        let mut lock = metadata_lock.lock().await;
-        *lock = Some(metadata);
+        match send_streaming_final_events(&tx, &anthropic_response).await {
+            Ok(()) => {
+                debug!(
+                    %message_id,
+                    content_blocks = anthropic_response.content.len(),
+                    stop_reason = anthropic_response.stop_reason,
+                    "completed streaming response"
+                );
+                let mut lock = metadata_lock.lock().await;
+                *lock = Some(metadata);
+            },
+            Err(err) => {
+                debug!(%message_id, ?err, "failed to send final message event");
+                let _ = send_sse(
+                    &tx,
+                    "error",
+                    &serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "stream_error",
+                            "message": "failed to send final message event"
+                        }
+                    }),
+                )
+                .await;
+                return;
+            },
+        }
     });
 
     Ok(response)
+}
+
+async fn send_streaming_final_events(
+    tx: &mpsc::Sender<Result<Bytes, Infallible>>,
+    response: &AnthropicMessageResponse,
+) -> Result<(), ()> {
+    trace!(
+        "sending final message_delta with stop_reason={:?} stop_sequence={:?}",
+        response.stop_reason,
+        response.stop_sequence
+    );
+    send_sse(
+        tx,
+        "message_delta",
+        &serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": response.stop_reason,
+                "stop_sequence": response.stop_sequence
+            }
+        }),
+    )
+    .await?;
+
+    trace!("sending message_stop event");
+    send_sse(tx, "message_stop", &serde_json::json!({ "type": "message_stop" })).await?;
+
+    trace!("sending final message payload");
+    send_sse(tx, "message", &serde_json::to_value(response).unwrap_or(serde_json::Value::Null)).await
+}
+
+fn format_tool_use_summary(tool: &AssistantToolUse) -> Option<String> {
+    if !tool.name.eq_ignore_ascii_case("TodoWrite") {
+        return None;
+    }
+
+    let todos = tool
+        .args
+        .get("todos")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if todos.is_empty() {
+        return Some("\nTodoWrite: no todo items provided.\n".to_string());
+    }
+
+    let mut lines = vec!["\nTodoWrite updated the following tasks:".to_string()];
+    for item in todos {
+        if let Some(obj) = item.as_object() {
+            let content = obj
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let status = obj
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let active_form = obj
+                .get("activeForm")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+
+            if active_form.is_empty() {
+                lines.push(format!("- [{status}] {content}"));
+            } else {
+                lines.push(format!("- [{status}] {content} ({active_form})"));
+            }
+        }
+    }
+    lines.push(String::new());
+    let summary = lines.join("\n");
+    debug!(
+        tool_use_id = tool.id,
+        tool_name = tool.name,
+        "generated todo summary: {}",
+        summary
+    );
+    Some(summary)
 }
 
 fn build_success_response(
@@ -1319,8 +1455,27 @@ async fn send_sse(
     payload: &serde_json::Value,
 ) -> Result<(), ()> {
     let data = serde_json::to_string(payload).map_err(|_| ())?;
+    trace!(
+        ?event,
+        data_len = data.len(),
+        preview = %truncate_for_log(&data),
+        "sending SSE event"
+    );
     let frame = format!("event: {event}\ndata: {data}\n\n");
     tx.send(Ok(Bytes::from(frame))).await.map_err(|_| ())
+}
+
+fn truncate_for_log(value: &str) -> String {
+    const MAX: usize = 200;
+    if value.len() <= MAX {
+        value.to_string()
+    } else {
+        format!(
+            "{}…{}",
+            &value[..MAX / 2],
+            &value[value.len().saturating_sub(MAX / 2)..]
+        )
+    }
 }
 
 #[cfg(test)]
