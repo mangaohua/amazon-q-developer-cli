@@ -808,7 +808,9 @@ fn build_conversation_state(
                     ));
                 }
 
-                if parts.text.trim().is_empty() && !parts.tool_results.is_empty() {
+                let has_user_text = !parts.text.trim().is_empty();
+
+                if !has_user_text && !parts.tool_results.is_empty() {
                     parts.text = render_tool_results_text(&parts.tool_results);
                 }
 
@@ -831,10 +833,15 @@ fn build_conversation_state(
                 };
 
                 if !system_prompt.is_empty() && is_last {
-                    if user_message.content.is_empty() {
+                    if has_user_text {
+                        if user_message.content.is_empty() {
+                            user_message.content = system_prompt.clone();
+                        } else {
+                            user_message.content =
+                                format!("{}\n\n{}", system_prompt, user_message.content);
+                        }
+                    } else if user_message.content.is_empty() {
                         user_message.content = system_prompt.clone();
-                    } else {
-                        user_message.content = format!("{}\n\n{}", system_prompt, user_message.content);
                     }
                 }
 
@@ -1644,6 +1651,65 @@ mod tests {
                 assert_eq!(spec.name, "search");
             },
         }
+    }
+
+    #[test]
+    fn build_conversation_state_does_not_duplicate_system_prompt_for_tool_results_only_message() {
+        let request = AnthropicMessageRequest {
+            model: "auto".to_string(),
+            system: Some(AnthropicSystemPrompt::Text(
+                "System instructions should only be sent once.".to_string(),
+            )),
+            messages: vec![
+                AnthropicMessage {
+                    role: AnthropicRole::User,
+                    content: AnthropicMessageContent::Text("Run a search".to_string()),
+                },
+                AnthropicMessage {
+                    role: AnthropicRole::Assistant,
+                    content: AnthropicMessageContent::Blocks(vec![
+                        json!({"type": "text", "text": "Invoking search"}),
+                        json!({"type": "tool_use", "id": "tool-1", "name": "search", "input": { "query": "rust" } }),
+                    ]),
+                },
+                AnthropicMessage {
+                    role: AnthropicRole::User,
+                    content: AnthropicMessageContent::Blocks(vec![json!({
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [{
+                            "type": "text",
+                            "text": "Search result summary"
+                        }],
+                        "is_error": false
+                    })]),
+                },
+            ],
+            tools: vec![AnthropicTool {
+                name: "search".to_string(),
+                description: Some("Search tool".to_string()),
+                input_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                })),
+            }],
+            stream: false,
+        };
+
+        let tools = build_tools(&request.tools).unwrap();
+        let conversation = build_conversation_state(&request, "CLAUDE_SONNET", &tools).unwrap();
+        let final_message = &conversation.user_input_message;
+
+        assert_eq!(final_message.content.trim(), "Search result summary");
+        assert!(
+            !final_message
+                .content
+                .contains("System instructions should only be sent once."),
+            "system prompt should not be reintroduced when user message only provided tool results"
+        );
     }
 
     #[test]
