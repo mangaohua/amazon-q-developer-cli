@@ -329,7 +329,7 @@ mod tests {
             repo_path: "test/repo".to_string(),
             model_file: "model.safetensors".to_string(),
             tokenizer_file: "tokenizer.json".to_string(),
-            #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+            #[cfg(not(any(target_os = "android", all(target_os = "linux", target_arch = "aarch64"))))]
             config: Default::default(),
             normalize_embeddings: true,
             batch_size: 32,
@@ -360,7 +360,7 @@ mod tests {
             repo_path: "test/repo".to_string(),
             model_file: "model.safetensors".to_string(),
             tokenizer_file: "tokenizer.json".to_string(),
-            #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+            #[cfg(not(any(target_os = "android", all(target_os = "linux", target_arch = "aarch64"))))]
             config: Default::default(),
             normalize_embeddings: true,
             batch_size: 32,
