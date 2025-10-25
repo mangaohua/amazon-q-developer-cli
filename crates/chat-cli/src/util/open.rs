@@ -47,6 +47,14 @@ fn open_command(url: impl AsRef<str>) -> std::process::Command {
     command
 }
 
+#[cfg(target_os = "android")]
+fn open_command(url: impl AsRef<str>) -> std::process::Command {
+    // Prefer Termux-specific helper when available.
+    let mut command = std::process::Command::new("termux-open-url");
+    command.arg(url.as_ref());
+    command
+}
+
 /// Returns bool indicating whether the URL was opened successfully
 #[allow(dead_code)]
 pub fn open_url(url: impl AsRef<str>) -> Result<(), Error> {

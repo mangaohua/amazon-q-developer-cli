@@ -141,6 +141,8 @@ pub fn os_version() -> Option<&'static OSVersion> {
                     Some(OSVersion::FreeBsd {
                         version,
                     })
+                } else {
+                    None
                 }
             }
         })
