@@ -1462,6 +1462,15 @@ fn resolve_model_id_from_list(trimmed: &str, model_list: &ModelListResult) -> Re
         return Ok(model_list.default_model.model_id().to_string());
     }
 
+    if trimmed.starts_with("claude-") {
+        debug!(
+            requested = trimmed,
+            fallback = model_list.default_model.model_id(),
+            "Requested Anthropics model is unavailable; falling back to default model."
+        );
+        return Ok(model_list.default_model.model_id().to_string());
+    }
+
     Err(ServeError::new(
         StatusCode::BAD_REQUEST,
         format!(
