@@ -62,6 +62,8 @@ use crate::theme::StyledText;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 const ANTHROPIC_VERSION_HEADER: HeaderName = HeaderName::from_static("anthropic-version");
+const TOOL_RESULT_TEXT_LIMIT: usize = 12_000;
+const TOOL_RESULT_TRUNCATED_SUFFIX: &str = "...content truncated...";
 
 /// Start a Claude-compatible REST server.
 #[derive(Debug, Args, Clone, Copy, PartialEq)]
@@ -820,13 +822,14 @@ fn build_conversation_state(
                     let mut sanitized = Vec::new();
                     for mut result in parts.tool_results.iter().cloned() {
                         if result.content.is_empty() {
-                            let placeholder = if matches!(result.status, ToolResultStatus::Success) {
-                                "Tool completed but produced no output.".to_string()
+                            let placeholder = if matches!(result.status, ToolResultStatus::Error) {
+                                "(error: tool returned no output)".to_string()
                             } else {
-                                "Tool reported an error but returned no output.".to_string()
+                                "(tool returned no output)".to_string()
                             };
                             result.content.push(ToolUseResultBlock::Text(placeholder));
                         }
+                        truncate_tool_use_result(&mut result, TOOL_RESULT_TEXT_LIMIT);
                         sanitized.push(result.into());
                     }
 
@@ -1095,6 +1098,33 @@ fn render_tool_results_text(results: &[ToolUseResult]) -> String {
     } else {
         parts.join(" ")
     }
+}
+
+fn truncate_tool_use_result(result: &mut ToolUseResult, max_len: usize) {
+    for block in &mut result.content {
+        match block {
+            ToolUseResultBlock::Text(text) => truncate_text(text, max_len),
+            ToolUseResultBlock::Json(value) => {
+                if let Ok(serialized) = serde_json::to_string(value) {
+                    if serialized.len() > max_len {
+                        let mut truncated = serialized.chars().take(max_len).collect::<String>();
+                        truncated.push_str(TOOL_RESULT_TRUNCATED_SUFFIX);
+                        *block = ToolUseResultBlock::Text(truncated);
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn truncate_text(text: &mut String, max_len: usize) {
+    if text.len() <= max_len {
+        return;
+    }
+
+    let mut truncated: String = text.chars().take(max_len).collect();
+    truncated.push_str(TOOL_RESULT_TRUNCATED_SUFFIX);
+    *text = truncated;
 }
 
 fn build_anthropic_response(
