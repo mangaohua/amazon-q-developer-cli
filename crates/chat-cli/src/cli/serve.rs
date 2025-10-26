@@ -817,7 +817,20 @@ fn build_conversation_state(
                 let tool_result_models: Option<Vec<ToolResult>> = if parts.tool_results.is_empty() {
                     None
                 } else {
-                    Some(parts.tool_results.iter().cloned().map(Into::into).collect())
+                    let mut sanitized = Vec::new();
+                    for mut result in parts.tool_results.iter().cloned() {
+                        if result.content.is_empty() {
+                            let placeholder = if matches!(result.status, ToolResultStatus::Success) {
+                                "Tool completed but produced no output.".to_string()
+                            } else {
+                                "Tool reported an error but returned no output.".to_string()
+                            };
+                            result.content.push(ToolUseResultBlock::Text(placeholder));
+                        }
+                        sanitized.push(result.into());
+                    }
+
+                    if sanitized.is_empty() { None } else { Some(sanitized) }
                 };
 
                 let mut user_message = UserInputMessage {
